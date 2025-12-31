@@ -4,6 +4,11 @@ import re
 import unicodedata
 from pathlib import PurePosixPath
 
+try:
+    from server import PromptServer
+except Exception:
+    PromptServer = None
+
 
 _ILLEGAL_CHARS = set('<>:"|?*')
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
@@ -100,6 +105,9 @@ class ShotPathBuilder:
                     "tooltip": "Version number used to build version_str and folders."
                 }),
             },
+            "hidden": {
+                "unique_id": "UNIQUE_ID",
+            },
         }
 
 
@@ -121,6 +129,7 @@ class ShotPathBuilder:
 
     FUNCTION = "build"
     CATEGORY = "NOLABEL/Paths"
+    OUTPUT_NODE = True
 
     def build(
         self,
@@ -132,6 +141,7 @@ class ShotPathBuilder:
         png_folder: str,
         sanitize: bool,
         tag: str,
+        unique_id=None,
     ):
         shot = shot_folder
         base = (base_name or "").strip()
@@ -164,10 +174,27 @@ class ShotPathBuilder:
         folder_standard = folder_standard_raw + "/"
         folder_png = folder_png_raw + "/"
 
-        return (
-            standard_path, png_path,
-            file_name,
-            version_str,
-            folder_standard, folder_png,
-        )
+        ui_lines = [
+            f"standard: {standard_path}",
+            f"png: {png_path}",
+        ]
 
+        if unique_id and PromptServer is not None:
+            try:
+                msg = (
+                    f"<b>standard:</b> {standard_path}<br>"
+                    f"<b>png:</b> {png_path}"
+                )
+                PromptServer.instance.send_progress_text(msg, unique_id)
+            except Exception:
+                pass
+
+        return {
+            "ui": {"text": ui_lines},
+            "result": (
+                standard_path, png_path,
+                file_name,
+                version_str,
+                folder_standard, folder_png,
+            ),
+        }
