@@ -22,17 +22,31 @@ function ensureStyles() {
     .nl-ml-table th, .nl-ml-table td { border-bottom: 1px solid #2e2e2e; padding: 4px 6px; text-align: left; }
     .nl-ml-table th { color: #9aa0a6; font-weight: 600; position: sticky; top: 0; background: #111; }
     .nl-ml-table td { vertical-align: top; }
+    .nl-ml-row-recent { background: rgba(76, 217, 100, 0.08); }
+    .nl-ml-row-warm { background: rgba(255, 214, 102, 0.08); }
+    .nl-ml-row-stale { background: rgba(255, 77, 77, 0.06); }
     .nl-ml-pill { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; }
     .nl-ml-pill.ok { background: #4cd964; }
     .nl-ml-pill.bad { background: #ff4d4d; }
     .nl-ml-muted { color: #9aa0a6; }
-    .nl-ml-actions button { background: #3a3a3a; border: 1px solid #555; color: #fff; padding: 2px 6px; border-radius: 4px; }
-    .nl-ml-actions button:disabled { opacity: 0.5; }
+    .nl-ml-localize { background: #3a3a3a; border: 1px solid #555; color: #fff; padding: 2px 6px; border-radius: 4px; margin-left: 6px; }
+    .nl-ml-localize:disabled { opacity: 0.5; }
     .nl-ml-delete { margin-left: 6px; background: transparent; border: 1px solid #444; color: #ff9c9c; padding: 0 4px; border-radius: 4px; cursor: pointer; }
     .nl-ml-delete:disabled { opacity: 0.4; cursor: default; }
     .nl-ml-progress { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
     .nl-ml-progress progress { width: 140px; height: 12px; }
     .nl-ml-message { color: #cbd5e1; }
+    .nl-ml-pagination { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
+    .nl-ml-pagination button { background: #2a2a2a; color: #f0f0f0; border: 1px solid #444; padding: 2px 8px; border-radius: 4px; cursor: pointer; }
+    .nl-ml-pagination button:disabled { opacity: 0.5; cursor: default; }
+    .nl-ml-pagination input[type="number"] { width: 52px; background: #111; color: #e6e6e6; border: 1px solid #333; border-radius: 4px; padding: 2px 6px; }
+    .nl-ml-page-info { display: inline-flex; align-items: center; gap: 4px; color: #9aa0a6; }
+    .nl-ml-settings { display: flex; align-items: center; gap: 6px; }
+    .nl-ml-settings input[type="number"] { width: 70px; background: #111; color: #e6e6e6; border: 1px solid #333; border-radius: 4px; padding: 2px 6px; }
+    .nl-ml-settings label { display: inline-flex; align-items: center; gap: 4px; color: #cbd5e1; }
+    .nl-ml-log { display: none; margin-top: 6px; border: 1px solid #2e2e2e; border-radius: 6px; padding: 6px; background: #0b0b0b; }
+    .nl-ml-log textarea { width: 100%; min-height: 140px; background: #111; color: #e6e6e6; border: 1px solid #333; border-radius: 4px; padding: 6px; font-family: "IBM Plex Mono", "Courier New", monospace; font-size: 11px; }
+    .nl-ml-log button { margin-bottom: 6px; background: #2a2a2a; color: #f0f0f0; border: 1px solid #444; padding: 2px 6px; border-radius: 4px; cursor: pointer; }
     `;
     document.head.appendChild(style);
 }
@@ -217,6 +231,31 @@ app.registerExtension({
         const localizeAllButton = document.createElement("button");
         localizeAllButton.textContent = "Localize All";
 
+        const settingsWrap = document.createElement("div");
+        settingsWrap.className = "nl-ml-settings";
+        const autoLabel = document.createElement("label");
+        const autoToggle = document.createElement("input");
+        autoToggle.type = "checkbox";
+        const autoText = document.createElement("span");
+        autoText.textContent = "Auto-prune";
+        autoLabel.append(autoToggle, autoText);
+
+        const maxLabel = document.createElement("span");
+        maxLabel.textContent = "Max GB";
+        const maxInput = document.createElement("input");
+        maxInput.type = "number";
+        maxInput.min = "0";
+        maxInput.step = "1";
+        maxInput.placeholder = "0";
+
+        const pruneButton = document.createElement("button");
+        pruneButton.textContent = "Prune Now";
+
+        const logButton = document.createElement("button");
+        logButton.textContent = "Log";
+
+        settingsWrap.append(autoLabel, maxLabel, maxInput, pruneButton, logButton);
+
         const cacheLabel = document.createElement("div");
         cacheLabel.className = "nl-ml-cache";
         cacheLabel.textContent = "Cache: -";
@@ -224,7 +263,7 @@ app.registerExtension({
         const errorLabel = document.createElement("div");
         errorLabel.className = "nl-ml-error";
 
-        bar.append(toggleWrap, refreshButton, localizeAllButton, cacheLabel, errorLabel);
+        bar.append(toggleWrap, refreshButton, localizeAllButton, settingsWrap, cacheLabel, errorLabel);
 
         const tableWrap = document.createElement("div");
         tableWrap.className = "nl-ml-table-wrap";
@@ -240,7 +279,7 @@ app.registerExtension({
                 <th>Local</th>
                 <th>Network</th>
                 <th>Size</th>
-                <th>Action</th>
+                <th>Last Used</th>
             </tr>
         `;
         table.appendChild(header);
@@ -248,6 +287,26 @@ app.registerExtension({
         const body = document.createElement("tbody");
         table.appendChild(body);
         tableWrap.appendChild(table);
+
+        const pagination = document.createElement("div");
+        pagination.className = "nl-ml-pagination";
+        const prevButton = document.createElement("button");
+        prevButton.textContent = "Prev";
+        const nextButton = document.createElement("button");
+        nextButton.textContent = "Next";
+        const pageSizeInput = document.createElement("input");
+        pageSizeInput.type = "number";
+        pageSizeInput.min = "1";
+        pageSizeInput.step = "1";
+        pageSizeInput.value = "5";
+        const pageInfo = document.createElement("div");
+        pageInfo.className = "nl-ml-page-info";
+        const pageStart = document.createElement("span");
+        pageStart.textContent = "1-";
+        const pageTotal = document.createElement("span");
+        pageTotal.textContent = "of 0";
+        pageInfo.append(pageStart, pageSizeInput, pageTotal);
+        pagination.append(prevButton, nextButton, pageInfo);
 
         const progressWrap = document.createElement("div");
         progressWrap.className = "nl-ml-progress";
@@ -263,18 +322,29 @@ app.registerExtension({
 
         progressWrap.append(progressBar, progressText, cancelButton);
 
-        root.append(bar, tableWrap, progressWrap);
+        const logWrap = document.createElement("div");
+        logWrap.className = "nl-ml-log";
+        const logClose = document.createElement("button");
+        logClose.textContent = "Close";
+        const logArea = document.createElement("textarea");
+        logArea.readOnly = true;
+        logWrap.append(logClose, logArea);
+
+        root.append(bar, tableWrap, pagination, progressWrap, logWrap);
 
         const widget = node.addDOMWidget("model_localizer", "model_localizer", root, { serialize: false });
         widget.serialize = false;
         widget.options.canvasOnly = false;
 
-        node.setSize([Math.max(node.size[0], 1120), Math.max(node.size[1], 420)]);
+        node.setSize([Math.max(node.size[0], 940), Math.max(node.size[1], 420 * 0.8)]);
 
         let latestData = [];
         let currentMode = "workflow";
         let currentJobId = null;
         let pollTimer = null;
+        let currentPage = 1;
+        let pageSize = 5;
+        let currentSettings = { auto_delete_enabled: false, max_cache_bytes: 0 };
 
         function setError(message) {
             errorLabel.textContent = message || "";
@@ -282,8 +352,11 @@ app.registerExtension({
 
         function setMode(mode) {
             currentMode = mode;
+            currentPage = 1;
             workflowButton.classList.toggle("active", mode === "workflow");
             localButton.classList.toggle("active", mode === "local");
+            pagination.style.display = mode === "local" ? "flex" : "none";
+            pageInfo.style.display = mode === "local" ? "inline-flex" : "none";
             refresh();
         }
 
@@ -295,14 +368,73 @@ app.registerExtension({
             for (const btn of body.querySelectorAll("button")) {
                 btn.disabled = isBusy || btn.dataset.disabled === "true";
             }
+            if (currentMode === "local") {
+                prevButton.disabled = isBusy || currentPage <= 1;
+                nextButton.disabled = isBusy || currentPage >= Math.max(1, Math.ceil(latestData.length / pageSize));
+            }
+        }
+
+        function updatePagination(totalItems) {
+            const totalPages = Math.max(1, Math.ceil(totalItems / pageSize));
+            if (currentPage > totalPages) currentPage = totalPages;
+            if (currentPage < 1) currentPage = 1;
+            prevButton.disabled = currentPage <= 1;
+            nextButton.disabled = currentPage >= totalPages;
+            const start = totalItems === 0 ? 0 : (currentPage - 1) * pageSize + 1;
+            const end = Math.min(currentPage * pageSize, totalItems);
+            pageStart.textContent = `${start}-`;
+            pageTotal.textContent = `of ${totalItems}`;
+        }
+
+        function sortItems(items) {
+            if (currentMode !== "local") return items;
+            return [...items].sort((a, b) => {
+                const scoreA = Number(a.usage_score || 0);
+                const scoreB = Number(b.usage_score || 0);
+                if (scoreA !== scoreB) return scoreB - scoreA;
+                const lastA = Number(a.last_used || 0);
+                const lastB = Number(b.last_used || 0);
+                if (lastA !== lastB) return lastB - lastA;
+                return String(a.category).localeCompare(String(b.category)) || String(a.relpath).localeCompare(String(b.relpath));
+            });
         }
 
         function renderRows(items) {
             body.innerHTML = "";
-            latestData = items;
+            const sortedItems = sortItems(items);
+            latestData = sortedItems;
 
-            for (const item of items) {
+            let pageItems = sortedItems;
+            if (currentMode === "local") {
+                updatePagination(sortedItems.length);
+                const startIndex = (currentPage - 1) * pageSize;
+                pageItems = sortedItems.slice(startIndex, startIndex + pageSize);
+            }
+            if (currentMode === "workflow") {
+                tableWrap.style.maxHeight = sortedItems.length > 8 ? "260px" : "none";
+            } else {
+                tableWrap.style.maxHeight = "260px";
+            }
+
+            const allSameLastUsed = sortedItems.every(
+                (item) => Number(item.last_used || 0) === Number(sortedItems[0]?.last_used || 0)
+            );
+            const totalItems = sortedItems.length;
+
+            for (let index = 0; index < pageItems.length; index += 1) {
+                const item = pageItems[index];
                 const row = document.createElement("tr");
+                if (!allSameLastUsed && totalItems >= 3) {
+                    const globalIndex = (currentMode === "local" ? (currentPage - 1) * pageSize : 0) + index;
+                    const ratio = totalItems > 1 ? globalIndex / (totalItems - 1) : 0;
+                    if (ratio <= 0.33) {
+                        row.classList.add("nl-ml-row-recent");
+                    } else if (ratio <= 0.66) {
+                        row.classList.add("nl-ml-row-warm");
+                    } else {
+                        row.classList.add("nl-ml-row-stale");
+                    }
+                }
 
                 const categoryCell = document.createElement("td");
                 categoryCell.textContent = item.category;
@@ -344,33 +476,30 @@ app.registerExtension({
                     sizeCell.textContent = "-";
                 }
 
-                const actionCell = document.createElement("td");
-                actionCell.className = "nl-ml-actions";
-                const actionButton = document.createElement("button");
+                const lastUsedCell = document.createElement("td");
+                lastUsedCell.textContent = formatLastUsed(Number(item.last_used || 0));
 
                 let canLocalize = false;
                 let overwrite = false;
                 if (item.network_exists && !item.local_exists) {
-                    actionButton.textContent = "Localize";
                     canLocalize = true;
                 } else if (item.network_exists && item.status === "different_size") {
-                    actionButton.textContent = "Re-localize";
                     canLocalize = true;
                     overwrite = true;
-                } else {
-                    actionButton.textContent = "-";
-                    actionButton.dataset.disabled = "true";
-                    actionButton.disabled = true;
-                    actionButton.classList.add("nl-ml-muted");
                 }
 
                 if (canLocalize) {
-                    actionButton.addEventListener("click", () => startLocalize([{ category: item.category, relpath: item.relpath }], overwrite));
+                    const localizeButton = document.createElement("button");
+                    localizeButton.className = "nl-ml-localize";
+                    localizeButton.textContent = "⬇";
+                    localizeButton.title = overwrite ? "Re-localize" : "Localize";
+                    localizeButton.addEventListener("click", () =>
+                        startLocalize([{ category: item.category, relpath: item.relpath }], overwrite)
+                    );
+                    localCell.appendChild(localizeButton);
                 }
 
-                actionCell.appendChild(actionButton);
-
-                row.append(categoryCell, nameCell, localCell, netCell, sizeCell, actionCell);
+                row.append(categoryCell, nameCell, localCell, netCell, sizeCell, lastUsedCell);
                 body.appendChild(row);
             }
         }
@@ -399,11 +528,121 @@ app.registerExtension({
                 }
 
                 cacheLabel.textContent = `Cache: ${data.cache_size_human} (${data.cache_size_bytes} bytes)`;
+                if (currentMode === "local") {
+                    currentPage = 1;
+                    if (data.settings) {
+                        applySettings(data.settings);
+                    }
+                }
                 renderRows(data.items || []);
                 progressText.textContent = "";
             } catch (err) {
                 setError(err.message || String(err));
                 progressText.textContent = "";
+            }
+        }
+
+        function formatGb(bytes) {
+            if (!bytes) return "";
+            const gb = bytes / (1024 ** 3);
+            return gb >= 10 ? gb.toFixed(0) : gb.toFixed(1);
+        }
+
+        function formatLastUsed(timestampSeconds) {
+            if (!timestampSeconds) return "-";
+            const date = new Date(timestampSeconds * 1000);
+            if (Number.isNaN(date.getTime())) return "-";
+            return date.toLocaleDateString();
+        }
+
+        function bytesFromGb(value) {
+            const num = Number(value);
+            if (!Number.isFinite(num) || num <= 0) return 0;
+            return Math.round(num * (1024 ** 3));
+        }
+
+        function applySettings(settings) {
+            currentSettings = {
+                auto_delete_enabled: Boolean(settings.auto_delete_enabled),
+                max_cache_bytes: Number(settings.max_cache_bytes || 0),
+            };
+            autoToggle.checked = currentSettings.auto_delete_enabled;
+            maxInput.value = formatGb(currentSettings.max_cache_bytes);
+            pruneButton.style.display = currentSettings.auto_delete_enabled ? "none" : "inline-flex";
+        }
+
+        async function loadSettings() {
+            try {
+                const response = await api.fetchApi("/model_localizer/settings");
+                const data = await readJsonOrText(response);
+                if (!response.ok) {
+                    throw new Error(data?.error || data?._raw || response.statusText);
+                }
+                applySettings(data);
+            } catch (err) {
+                setError(err.message || String(err));
+            }
+        }
+
+        async function saveSettings() {
+            const maxCacheBytes = bytesFromGb(maxInput.value);
+            try {
+                const response = await api.fetchApi("/model_localizer/settings", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        auto_delete_enabled: autoToggle.checked,
+                        max_cache_bytes: maxCacheBytes,
+                    }),
+                });
+                const data = await readJsonOrText(response);
+                if (!response.ok) {
+                    throw new Error(data?.error || data?._raw || response.statusText);
+                }
+                applySettings(data);
+            } catch (err) {
+                setError(err.message || String(err));
+            }
+        }
+
+        async function pruneNow() {
+            setError("");
+            setBusy(true);
+            progressText.textContent = "Pruning cache...";
+            try {
+                const response = await api.fetchApi("/model_localizer/prune", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ max_cache_bytes: bytesFromGb(maxInput.value) }),
+                });
+                const data = await readJsonOrText(response);
+                if (!response.ok) {
+                    throw new Error(data?.error || data?._raw || response.statusText);
+                }
+                await refresh();
+            } catch (err) {
+                setError(err.message || String(err));
+            } finally {
+                setBusy(false);
+                progressText.textContent = "";
+            }
+        }
+
+        async function toggleLog() {
+            if (logWrap.style.display === "block") {
+                logWrap.style.display = "none";
+                return;
+            }
+            try {
+                const response = await api.fetchApi("/model_localizer/prune_log");
+                const data = await readJsonOrText(response);
+                if (!response.ok) {
+                    throw new Error(data?.error || data?._raw || response.statusText);
+                }
+                logArea.value = data.text || "No log entries yet.";
+                logWrap.style.display = "block";
+            } catch (err) {
+                setError(err.message || String(err));
             }
         }
 
@@ -496,6 +735,37 @@ app.registerExtension({
         refreshButton.addEventListener("click", refresh);
         workflowButton.addEventListener("click", () => setMode("workflow"));
         localButton.addEventListener("click", () => setMode("local"));
+        pageSizeInput.addEventListener("change", () => {
+            const value = Number(pageSizeInput.value);
+            if (Number.isFinite(value) && value > 0) {
+                pageSize = value;
+                currentPage = 1;
+                renderRows(latestData);
+            }
+        });
+        autoToggle.addEventListener("change", () => {
+            pruneButton.style.display = autoToggle.checked ? "none" : "inline-flex";
+            saveSettings();
+        });
+        maxInput.addEventListener("change", saveSettings);
+        pruneButton.addEventListener("click", pruneNow);
+        logButton.addEventListener("click", toggleLog);
+        logClose.addEventListener("click", () => {
+            logWrap.style.display = "none";
+        });
+        prevButton.addEventListener("click", () => {
+            if (currentPage > 1) {
+                currentPage -= 1;
+                renderRows(latestData);
+            }
+        });
+        nextButton.addEventListener("click", () => {
+            const totalPages = Math.max(1, Math.ceil(latestData.length / pageSize));
+            if (currentPage < totalPages) {
+                currentPage += 1;
+                renderRows(latestData);
+            }
+        });
 
         localizeAllButton.addEventListener("click", () => {
             const items = latestData.filter(
@@ -519,6 +789,7 @@ app.registerExtension({
             }
         });
 
-        refresh();
+        setMode("workflow");
+        loadSettings();
     },
 });

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
 import os
+import sys
 import threading
+import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
@@ -23,6 +26,31 @@ except Exception:  # pragma: no cover
 
 
 _CHUNK_SIZE = 16 * 1024 * 1024
+_USER_DATA_DIRNAME = "comfyui-nl-nodes"
+_LOG_MAX_LINES = 200
+
+
+def _user_data_dir() -> Path:
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
+        if not base:
+            base = os.path.join(Path.home(), "AppData", "Local")
+    else:
+        base = os.environ.get("XDG_STATE_HOME")
+        if not base:
+            base = os.path.join(Path.home(), ".local", "state")
+    path = Path(base) / _USER_DATA_DIRNAME
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return path
+
+
+_USAGE_PATH = _user_data_dir() / "model_localizer_usage.json"
+_ACTION_LOG_PATH = _user_data_dir() / "model_localizer_actions.log"
+_USAGE_DEFAULTS = {"auto_delete_enabled": False, "max_cache_bytes": 200 * 1024 ** 3}
+_usage_lock = threading.Lock()
 
 
 class ModelLocalizer:
@@ -228,6 +256,207 @@ def _file_size(path: str) -> int | None:
         return None
 
 
+def _path_exists(path: Path | None) -> bool:
+    if path is None:
+        return False
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
+def _usage_key(category: str, relpath: str) -> str:
+    return f"{category}/{relpath}"
+
+
+def _read_usage() -> dict:
+    if not _USAGE_PATH.exists():
+        return {"items": {}, "settings": dict(_USAGE_DEFAULTS)}
+    try:
+        with open(_USAGE_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle) or {}
+    except Exception:
+        return {"items": {}, "settings": dict(_USAGE_DEFAULTS)}
+
+    items = data.get("items", {})
+    if not isinstance(items, dict):
+        items = {}
+
+    settings = data.get("settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+
+    merged_settings = dict(_USAGE_DEFAULTS)
+    for key in merged_settings:
+        if key in settings:
+            merged_settings[key] = settings[key]
+
+    return {"items": items, "settings": merged_settings}
+
+
+def _write_usage(data: dict) -> None:
+    try:
+        with open(_USAGE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(data, handle)
+    except Exception:
+        pass
+
+
+def _append_action_log(entry: dict) -> None:
+    try:
+        line = json.dumps(entry, ensure_ascii=True)
+        with open(_ACTION_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _read_action_log() -> str:
+    if not _ACTION_LOG_PATH.exists():
+        return ""
+    try:
+        with open(_ACTION_LOG_PATH, "r", encoding="utf-8") as handle:
+            lines = handle.readlines()
+        if len(lines) > _LOG_MAX_LINES:
+            lines = lines[-_LOG_MAX_LINES :]
+        return "".join(lines)
+    except Exception:
+        return ""
+
+
+def _log_action(action: str, details: dict) -> None:
+    entry = {"timestamp": time.time(), "action": action}
+    entry.update(details)
+    _append_action_log(entry)
+
+
+def _record_usage(items: list[dict], kind: str) -> None:
+    if not items:
+        return
+    now = time.time()
+    with _usage_lock:
+        data = _read_usage()
+        usage = data.setdefault("items", {})
+        for item in items:
+            category = item.get("category")
+            relpath = item.get("relpath")
+            if not category or not relpath:
+                continue
+            key = _usage_key(category, relpath)
+            entry = usage.setdefault(key, {})
+            if kind == "workflow":
+                entry["workflow_hits"] = int(entry.get("workflow_hits", 0)) + 1
+                entry["last_seen"] = now
+            elif kind == "localize":
+                entry["localize_hits"] = int(entry.get("localize_hits", 0)) + 1
+                entry["last_localize"] = now
+                entry["last_seen"] = now
+        _write_usage(data)
+
+
+def _usage_snapshot() -> tuple[dict, dict]:
+    with _usage_lock:
+        data = _read_usage()
+    return data.get("items", {}), data.get("settings", dict(_USAGE_DEFAULTS))
+
+
+def _remove_usage_entry(category: str, relpath: str) -> None:
+    key = _usage_key(category, relpath)
+    with _usage_lock:
+        data = _read_usage()
+        usage = data.get("items", {})
+        if key in usage:
+            usage.pop(key, None)
+            _write_usage(data)
+
+
+def _set_settings(auto_delete_enabled: bool | None, max_cache_bytes: int | None) -> dict:
+    with _usage_lock:
+        data = _read_usage()
+        settings = data.setdefault("settings", dict(_USAGE_DEFAULTS))
+        if auto_delete_enabled is not None:
+            settings["auto_delete_enabled"] = bool(auto_delete_enabled)
+        if max_cache_bytes is not None:
+            settings["max_cache_bytes"] = max(0, int(max_cache_bytes))
+        _write_usage(data)
+        return settings
+
+
+def _prune_cache(max_cache_bytes: int, source: str) -> dict:
+    try:
+        local_base, _, local_dirs, _ = _parse_extra_model_paths()
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    usage, _ = _usage_snapshot()
+    items = []
+    total_bytes = 0
+    for category, local_subdir in local_dirs.items():
+        try:
+            local_root = _category_base(local_base, local_subdir)
+        except Exception:
+            continue
+        if not local_root.exists():
+            continue
+        for root, _, files in os.walk(local_root):
+            for name in files:
+                local_path = Path(root) / name
+                size = _file_size(str(local_path))
+                if size is None:
+                    continue
+                try:
+                    relpath = local_path.relative_to(local_root).as_posix()
+                except Exception:
+                    continue
+                key = _usage_key(category, relpath)
+                entry = usage.get(key, {})
+                last_seen = entry.get("last_seen")
+                last_localize = entry.get("last_localize")
+                last_used = max(
+                    last_seen if isinstance(last_seen, (int, float)) else 0,
+                    last_localize if isinstance(last_localize, (int, float)) else 0,
+                )
+                items.append((last_used, category, relpath, local_path, size))
+                total_bytes += size
+
+    if max_cache_bytes <= 0 or total_bytes <= max_cache_bytes:
+        return {"removed": [], "bytes_freed": 0, "bytes_before": total_bytes, "bytes_after": total_bytes}
+
+    items.sort(key=lambda x: x[0])
+    bytes_freed = 0
+    removed = []
+    for _, category, relpath, path, size in items:
+        if total_bytes - bytes_freed <= max_cache_bytes:
+            break
+        try:
+            path.unlink()
+            bytes_freed += size
+            removed.append({"category": category, "relpath": relpath, "bytes": size})
+            _remove_usage_entry(category, relpath)
+        except Exception:
+            continue
+
+    bytes_after = max(0, total_bytes - bytes_freed)
+    if removed:
+        _log_action(
+            "prune",
+            {
+                "source": source,
+                "max_cache_bytes": max_cache_bytes,
+                "bytes_before": total_bytes,
+                "bytes_after": bytes_after,
+                "bytes_freed": bytes_freed,
+                "removed": removed,
+            },
+        )
+    return {
+        "removed": removed,
+        "bytes_freed": bytes_freed,
+        "bytes_before": total_bytes,
+        "bytes_after": bytes_after,
+    }
+
+
 class _JobManager:
     def __init__(self):
         self._lock = threading.Lock()
@@ -326,7 +555,8 @@ class _JobManager:
                 return
 
             network_size = _file_size(str(network_path))
-            local_size = _file_size(str(local_path)) if local_path.exists() else None
+            local_exists = _path_exists(local_path)
+            local_size = _file_size(str(local_path)) if local_exists else None
             if local_size is not None and network_size is not None and local_size == network_size and not overwrite:
                 continue
 
@@ -348,6 +578,7 @@ class _JobManager:
         self._update(job_id, bytes_total=total_bytes, bytes_done=0)
 
         bytes_done = 0
+        copied_items = []
         for category, relpath, local_path, network_path, network_size in to_copy:
             if self._is_cancelled(job_id):
                 self._update(job_id, state="cancelled", message="Cancelled", current_item=None)
@@ -376,6 +607,17 @@ class _JobManager:
                     dst.flush()
                     os.fsync(dst.fileno())
                 os.replace(temp_path, local_path)
+                _log_action(
+                    "localize",
+                    {
+                        "source": "manual",
+                        "category": category,
+                        "relpath": relpath,
+                        "bytes": network_size,
+                        "overwrite": overwrite,
+                    },
+                )
+                copied_items.append({"category": category, "relpath": relpath})
             except Exception as exc:
                 try:
                     if temp_path.exists():
@@ -386,6 +628,21 @@ class _JobManager:
                     self._update(job_id, state="cancelled", message="Cancelled", current_item=None)
                     return
                 self._update(job_id, state="error", message=str(exc), current_item=None)
+                return
+
+        _record_usage(copied_items, "localize")
+
+        settings = _usage_snapshot()[1]
+        if settings.get("auto_delete_enabled") and int(settings.get("max_cache_bytes", 0)) > 0:
+            prune = _prune_cache(int(settings.get("max_cache_bytes", 0)), "auto")
+            if prune.get("bytes_freed"):
+                freed = _human_size(int(prune.get("bytes_freed", 0)))
+                self._update(
+                    job_id,
+                    state="done",
+                    message=f"Localization complete (pruned {freed})",
+                    current_item=None,
+                )
                 return
 
         self._update(job_id, state="done", message="Localization complete", current_item=None)
@@ -435,8 +692,8 @@ async def _scan(request):
                 except Exception:
                     continue
 
-                local_exists = bool(local_path and local_path.exists())
-                network_exists = bool(network_path and network_path.exists())
+                local_exists = _path_exists(local_path)
+                network_exists = _path_exists(network_path)
                 if not local_exists and not network_exists:
                     continue
 
@@ -471,6 +728,7 @@ async def _scan(request):
                     }
                 )
 
+    _record_usage(items, "workflow")
     cache_size = _dir_size(local_base)
 
     return web.json_response(
@@ -490,6 +748,7 @@ async def _list_local(request):
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
+    usage, settings = _usage_snapshot()
     items = []
     for category, local_subdir in local_dirs.items():
         try:
@@ -516,7 +775,7 @@ async def _list_local(request):
                 if network_subdir:
                     try:
                         network_path = _safe_join(network_base, network_subdir, relpath)
-                        network_exists = network_path.exists()
+                        network_exists = _path_exists(network_path)
                         network_size = _file_size(str(network_path)) if network_exists else None
                     except Exception:
                         network_exists = False
@@ -539,10 +798,25 @@ async def _list_local(request):
                         "local_size_bytes": local_size,
                         "network_size_bytes": network_size,
                         "status": status,
+                        "usage": usage.get(_usage_key(category, relpath), {}),
                     }
                 )
 
     cache_size = _dir_size(local_base)
+
+    def _usage_score(item: dict) -> tuple:
+        usage_data = item.get("usage") or {}
+        workflow_hits = int(usage_data.get("workflow_hits", 0))
+        localize_hits = int(usage_data.get("localize_hits", 0))
+        last_seen = usage_data.get("last_seen")
+        last_localize = usage_data.get("last_localize")
+        last_used = max(
+            last_seen if isinstance(last_seen, (int, float)) else 0,
+            last_localize if isinstance(last_localize, (int, float)) else 0,
+        )
+        item["usage_score"] = workflow_hits + localize_hits
+        item["last_used"] = last_used
+        return (-item["usage_score"], -item["last_used"], item["category"], item["relpath"])
 
     return web.json_response(
         {
@@ -550,7 +824,8 @@ async def _list_local(request):
             "network_base": network_base,
             "cache_size_bytes": cache_size,
             "cache_size_human": _human_size(cache_size),
-            "items": sorted(items, key=lambda x: (x["category"], x["relpath"])),
+            "items": sorted(items, key=_usage_score),
+            "settings": settings,
         }
     )
 
@@ -646,7 +921,58 @@ async def _delete_local(request):
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=500)
 
+    _log_action(
+        "delete_local",
+        {
+            "source": "manual",
+            "category": category,
+            "relpath": relpath,
+        },
+    )
+    _remove_usage_entry(category, relpath)
     return web.json_response({"ok": True})
+
+
+async def _get_settings(request):
+    _, settings = _usage_snapshot()
+    return web.json_response(settings)
+
+
+async def _set_settings_api(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    auto_delete_enabled = payload.get("auto_delete_enabled")
+    max_cache_bytes = payload.get("max_cache_bytes")
+    settings = _set_settings(auto_delete_enabled, max_cache_bytes)
+    return web.json_response(settings)
+
+
+async def _prune(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    max_cache_bytes = payload.get("max_cache_bytes")
+    if max_cache_bytes is None:
+        _, settings = _usage_snapshot()
+        max_cache_bytes = settings.get("max_cache_bytes", 0)
+    try:
+        max_cache_bytes = int(max_cache_bytes)
+    except Exception:
+        max_cache_bytes = 0
+
+    result = _prune_cache(max_cache_bytes, "manual")
+    if result.get("error"):
+        return web.json_response({"error": result["error"]}, status=400)
+    return web.json_response(result)
+
+
+async def _get_action_log(request):
+    return web.json_response({"text": _read_action_log()})
 
 
 def _register_routes():
@@ -683,6 +1009,26 @@ def _register_routes():
     @routes.get("/model_localizer/list_local")
     async def list_local(request):
         return await _list_local(request)
+
+    @routes.get("/model_localizer/settings")
+    async def get_settings(request):
+        return await _get_settings(request)
+
+    @routes.post("/model_localizer/settings")
+    async def set_settings(request):
+        return await _set_settings_api(request)
+
+    @routes.post("/model_localizer/prune")
+    async def prune(request):
+        return await _prune(request)
+
+    @routes.get("/model_localizer/prune_log")
+    async def prune_log(request):
+        return await _get_action_log(request)
+
+    @routes.get("/model_localizer/log")
+    async def action_log(request):
+        return await _get_action_log(request)
 
     app = PromptServer.instance.app
     app.add_routes(routes)
