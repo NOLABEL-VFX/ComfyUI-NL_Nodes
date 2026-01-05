@@ -28,6 +28,7 @@ except Exception:  # pragma: no cover
 _CHUNK_SIZE = 16 * 1024 * 1024
 _USER_DATA_DIRNAME = "comfyui-nl-nodes"
 _LOG_MAX_LINES = 200
+_PROGRESS_LOG_INTERVAL = 2.0
 
 
 def _user_data_dir() -> Path:
@@ -186,13 +187,17 @@ def _candidate_relpaths(raw: str, category: str) -> list[str]:
     rel = _normalize_relpath(raw)
     if not rel:
         return []
-    variants = {rel}
+    exact_rel = rel
     prefix = f"{category}/"
     if rel.startswith(prefix):
         trimmed = rel[len(prefix) :]
         if trimmed:
-            variants.add(trimmed)
-    return list(variants)
+            exact_rel = trimmed
+    variants = [exact_rel]
+    name_only = PurePosixPath(exact_rel).name
+    if name_only and name_only != exact_rel:
+        variants.append(name_only)
+    return variants
 
 
 def _is_within(path: Path, base: Path) -> bool:
@@ -251,6 +256,8 @@ def _dir_size(path: str) -> int:
 
 def _file_size(path: str) -> int | None:
     try:
+        if not os.path.isfile(path):
+            return None
         return os.path.getsize(path)
     except Exception:
         return None
@@ -260,7 +267,7 @@ def _path_exists(path: Path | None) -> bool:
     if path is None:
         return False
     try:
-        return path.exists()
+        return path.is_file()
     except OSError:
         return False
 
@@ -311,6 +318,52 @@ def _append_action_log(entry: dict) -> None:
         pass
 
 
+def _format_timestamp(value: object) -> str:
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(float(value)))
+    except Exception:
+        return "unknown time"
+
+
+def _format_action_entry(entry: dict) -> list[str]:
+    timestamp = _format_timestamp(entry.get("timestamp"))
+    action = entry.get("action") or "action"
+    source = entry.get("source")
+    source_text = f" ({source})" if source else ""
+
+    if action == "localize":
+        category = entry.get("category") or "unknown"
+        relpath = entry.get("relpath") or "unknown"
+        size = _human_size(entry.get("bytes"))
+        overwrite = "yes" if entry.get("overwrite") else "no"
+        return [
+            f"[{timestamp}] Localize{source_text}: {category}/{relpath} ({size}, overwrite: {overwrite})"
+        ]
+
+    if action == "delete_local":
+        category = entry.get("category") or "unknown"
+        relpath = entry.get("relpath") or "unknown"
+        return [f"[{timestamp}] Delete local{source_text}: {category}/{relpath}"]
+
+    if action == "prune":
+        bytes_before = _human_size(entry.get("bytes_before"))
+        bytes_after = _human_size(entry.get("bytes_after"))
+        bytes_freed = _human_size(entry.get("bytes_freed"))
+        removed = entry.get("removed") or []
+        lines = [
+            f"[{timestamp}] Prune{source_text}: freed {bytes_freed} (before {bytes_before}, after {bytes_after})",
+            f"Removed items: {len(removed)}",
+        ]
+        for item in removed:
+            category = item.get("category") or "unknown"
+            relpath = item.get("relpath") or "unknown"
+            size = _human_size(item.get("bytes"))
+            lines.append(f"  - {category}/{relpath} ({size})")
+        return lines
+
+    return [f"[{timestamp}] {action}{source_text}: {json.dumps(entry, ensure_ascii=True)}"]
+
+
 def _read_action_log() -> str:
     if not _ACTION_LOG_PATH.exists():
         return ""
@@ -319,7 +372,21 @@ def _read_action_log() -> str:
             lines = handle.readlines()
         if len(lines) > _LOG_MAX_LINES:
             lines = lines[-_LOG_MAX_LINES :]
-        return "".join(lines)
+        output_lines = []
+        for line in lines:
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                entry = json.loads(raw)
+            except Exception:
+                output_lines.append(raw)
+                continue
+            if isinstance(entry, dict):
+                output_lines.extend(_format_action_entry(entry))
+            else:
+                output_lines.append(raw)
+        return "\n".join(output_lines)
     except Exception:
         return ""
 
@@ -467,6 +534,7 @@ class _JobManager:
         job_id = str(uuid.uuid4())
         job = {
             "id": job_id,
+            "created_at": time.time(),
             "state": "queued",
             "items": items,
             "overwrite": overwrite,
@@ -485,6 +553,18 @@ class _JobManager:
         with self._lock:
             job = self._jobs.get(job_id)
             return dict(job) if job else None
+
+    def get_active_job_id(self) -> str | None:
+        with self._lock:
+            active = [
+                job
+                for job in self._jobs.values()
+                if job.get("state") in ("queued", "running")
+            ]
+            if not active:
+                return None
+            active.sort(key=lambda item: item.get("created_at", 0), reverse=True)
+            return active[0].get("id")
 
     def cancel_job(self, job_id: str) -> bool:
         with self._lock:
@@ -507,6 +587,7 @@ class _JobManager:
             return bool(job and job.get("cancel"))
 
     def _run_job(self, job_id: str):
+        print(f"[NL Model Localizer] Job {job_id} starting", flush=True)
         self._update(job_id, state="running", message="Starting")
 
         job = self.get_job(job_id)
@@ -573,21 +654,33 @@ class _JobManager:
 
         if not to_copy:
             self._update(job_id, state="done", bytes_total=0, message="Nothing to localize")
+            print(f"[NL Model Localizer] Job {job_id} nothing to localize", flush=True)
             return
 
         self._update(job_id, bytes_total=total_bytes, bytes_done=0)
+        print(
+            f"[NL Model Localizer] Job {job_id} queued {len(to_copy)} files ({_human_size(total_bytes)})",
+            flush=True,
+        )
 
         bytes_done = 0
         copied_items = []
+        last_log_time = time.monotonic()
+        last_percent = -1
         for category, relpath, local_path, network_path, network_size in to_copy:
             if self._is_cancelled(job_id):
                 self._update(job_id, state="cancelled", message="Cancelled", current_item=None)
+                print(f"[NL Model Localizer] Job {job_id} cancelled", flush=True)
                 return
 
             self._update(
                 job_id,
                 current_item={"category": category, "relpath": relpath},
                 message=f"Copying {category}/{relpath}",
+            )
+            print(
+                f"[NL Model Localizer] Job {job_id} copying {category}/{relpath} ({_human_size(network_size)})",
+                flush=True,
             )
 
             temp_path = Path(f"{local_path}.partial.{job_id}")
@@ -604,6 +697,19 @@ class _JobManager:
                         dst.write(chunk)
                         bytes_done += len(chunk)
                         self._update(job_id, bytes_done=bytes_done)
+                        if total_bytes > 0:
+                            percent = int((bytes_done / total_bytes) * 100)
+                        else:
+                            percent = 0
+                        now = time.monotonic()
+                        if percent != last_percent and (now - last_log_time) >= _PROGRESS_LOG_INTERVAL:
+                            last_percent = percent
+                            last_log_time = now
+                            print(
+                                f"[NL Model Localizer] Job {job_id} progress {percent}% "
+                                f"({_human_size(bytes_done)} / {_human_size(total_bytes)})",
+                                flush=True,
+                            )
                     dst.flush()
                     os.fsync(dst.fileno())
                 os.replace(temp_path, local_path)
@@ -626,8 +732,10 @@ class _JobManager:
                     pass
                 if str(exc) == "Cancelled":
                     self._update(job_id, state="cancelled", message="Cancelled", current_item=None)
+                    print(f"[NL Model Localizer] Job {job_id} cancelled", flush=True)
                     return
                 self._update(job_id, state="error", message=str(exc), current_item=None)
+                print(f"[NL Model Localizer] Job {job_id} error: {exc}", flush=True)
                 return
 
         _record_usage(copied_items, "localize")
@@ -643,9 +751,14 @@ class _JobManager:
                     message=f"Localization complete (pruned {freed})",
                     current_item=None,
                 )
+                print(
+                    f"[NL Model Localizer] Job {job_id} complete (pruned {freed})",
+                    flush=True,
+                )
                 return
 
         self._update(job_id, state="done", message="Localization complete", current_item=None)
+        print(f"[NL Model Localizer] Job {job_id} complete", flush=True)
 
 
 _job_manager = _JobManager()
@@ -727,6 +840,7 @@ async def _scan(request):
                         "status": status,
                     }
                 )
+                break
 
     _record_usage(items, "workflow")
     cache_size = _dir_size(local_base)
@@ -882,6 +996,11 @@ async def _job_status(request):
     )
 
 
+async def _job_active(request):
+    job_id = _job_manager.get_active_job_id()
+    return web.json_response({"job_id": job_id})
+
+
 async def _job_cancel(request):
     job_id = request.match_info.get("job_id")
     ok = _job_manager.cancel_job(job_id) if job_id else False
@@ -904,22 +1023,34 @@ async def _delete_local(request):
     except Exception as exc:
         return web.json_response({"error": str(exc)}, status=400)
 
+    error, status = _delete_local_item(category, relpath, local_base, local_dirs)
+    if error:
+        return web.json_response({"error": error}, status=status)
+    return web.json_response({"ok": True})
+
+
+def _delete_local_item(
+    category: str, relpath: str, local_base: str, local_dirs: dict
+) -> tuple[str | None, int]:
+    if not category or not relpath:
+        return "category and relpath required", 400
+
     local_subdir = local_dirs.get(category)
     if not local_subdir:
-        return web.json_response({"error": "category not configured for local models"}, status=400)
+        return "category not configured for local models", 400
 
     try:
         local_path = _safe_join(local_base, local_subdir, relpath)
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=400)
+        return str(exc), 400
 
     if not local_path.exists():
-        return web.json_response({"error": "local file not found"}, status=404)
+        return "local file not found", 404
 
     try:
         local_path.unlink()
     except Exception as exc:
-        return web.json_response({"error": str(exc)}, status=500)
+        return str(exc), 500
 
     _log_action(
         "delete_local",
@@ -930,7 +1061,38 @@ async def _delete_local(request):
         },
     )
     _remove_usage_entry(category, relpath)
-    return web.json_response({"ok": True})
+    return None, 200
+
+
+async def _delete_local_batch(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    items = payload.get("items") or []
+    if not isinstance(items, list) or not items:
+        return web.json_response({"error": "items required"}, status=400)
+
+    try:
+        local_base, _, local_dirs, _ = _parse_extra_model_paths()
+    except Exception as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    deleted = []
+    errors = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        category = item.get("category")
+        relpath = _normalize_relpath(item.get("relpath")) if item.get("relpath") else None
+        error, status = _delete_local_item(category, relpath, local_base, local_dirs)
+        if error:
+            errors.append({"category": category, "relpath": relpath, "error": error, "status": status})
+        else:
+            deleted.append({"category": category, "relpath": relpath})
+
+    return web.json_response({"deleted": deleted, "errors": errors})
 
 
 async def _get_settings(request):
@@ -998,6 +1160,10 @@ def _register_routes():
     async def job_status(request):
         return await _job_status(request)
 
+    @routes.get("/model_localizer/job")
+    async def job_active(request):
+        return await _job_active(request)
+
     @routes.post("/model_localizer/job/{job_id}/cancel")
     async def job_cancel(request):
         return await _job_cancel(request)
@@ -1005,6 +1171,10 @@ def _register_routes():
     @routes.post("/model_localizer/delete_local")
     async def delete_local(request):
         return await _delete_local(request)
+
+    @routes.post("/model_localizer/delete_local_batch")
+    async def delete_local_batch(request):
+        return await _delete_local_batch(request)
 
     @routes.get("/model_localizer/list_local")
     async def list_local(request):

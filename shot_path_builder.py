@@ -62,6 +62,7 @@ class ShotPathBuilder:
     Outputs:
       standard_path = {shot}/{version_str}/{file_name}
       png_path      = {shot}/{version_str}/{png_folder}/{file_name}
+      still_frame_path = {shot}/{base}
       file_name     = {base}{delim}{version_str}[{delim}{tag}]
     """
 
@@ -114,14 +115,14 @@ class ShotPathBuilder:
 
 
     RETURN_TYPES = (
-        "STRING", "STRING",  # standard_path, png_path
+        "STRING", "STRING", "STRING",  # standard_path, png_path, still_frame_path
         "STRING",            # file_name
         "STRING",            # version_str
         "STRING", "STRING",  # folder_standard, folder_png
     )
 
     RETURN_NAMES = (
-        "standard_path", "png_path",
+        "standard_path", "png_path", "still_frame_path",
         "file_name",
         "version_str",
         "folder_standard", "folder_png",
@@ -169,6 +170,7 @@ class ShotPathBuilder:
 
         standard_path = _posix_join(folder_standard_raw, file_name)
         png_path = _posix_join(folder_png_raw, file_name)
+        still_frame_path = _posix_join(shot, base)
 
         # trailing slash, as requested
         folder_standard = folder_standard_raw + "/"
@@ -177,13 +179,15 @@ class ShotPathBuilder:
         ui_lines = [
             f"standard: {standard_path}",
             f"png: {png_path}",
+            f"still frame: {still_frame_path}",
         ]
 
         if unique_id and PromptServer is not None:
             try:
                 msg = (
                     f"<b>standard:</b> {standard_path}<br>"
-                    f"<b>png:</b> {png_path}"
+                    f"<b>png:</b> {png_path}<br>"
+                    f"<b>still frame:</b> {still_frame_path}"
                 )
                 PromptServer.instance.send_progress_text(msg, unique_id)
             except Exception:
@@ -192,7 +196,7 @@ class ShotPathBuilder:
         return {
             "ui": {"text": ui_lines},
             "result": (
-                standard_path, png_path,
+                standard_path, png_path, still_frame_path,
                 file_name,
                 version_str,
                 folder_standard, folder_png,

@@ -22,6 +22,7 @@ Generates predictable, sanitized paths and filenames with versioning to keep sho
 ### Outputs
 - `standard_path`: `{shot}/{version_str}/{file_name}`
 - `png_path`: `{shot}/{version_str}/{png_folder}/{file_name}`
+- `still_frame_path`: `{shot}/{base}`
 - `file_name`: `{base}{delim}{version_str}[{delim}{tag}]`
 - `version_str`: Formatted version string.
 - `folder_standard`: `{shot}/{version_str}/` (trailing slash included).
@@ -38,6 +39,7 @@ With `shot_folder="PFX_101_010_0010_SUBJECT_1001-1081"`, `base_name=""`, `versio
 - `file_name`: `PFX_101_010_0010_SUBJECT_1001-1081_v003_beauty`
 - `standard_path`: `PFX_101_010_0010_SUBJECT_1001-1081/v003/PFX_101_010_0010_SUBJECT_1001-1081_v003_beauty`
 - `png_path`: `PFX_101_010_0010_SUBJECT_1001-1081/v003/PNG/PFX_101_010_0010_SUBJECT_1001-1081_v003_beauty`
+- `still_frame_path`: `PFX_101_010_0010_SUBJECT_1001-1081/PFX_101_010_0010_SUBJECT_1001-1081`
 - `folder_standard`: `PFX_101_010_0010_SUBJECT_1001-1081/v003/`
 - `folder_png`: `PFX_101_010_0010_SUBJECT_1001-1081/v003/PNG/`
 

@@ -22,6 +22,7 @@ function ensureStyles() {
     .nl-ml-table th, .nl-ml-table td { border-bottom: 1px solid #2e2e2e; padding: 4px 6px; text-align: left; }
     .nl-ml-table th { color: #9aa0a6; font-weight: 600; position: sticky; top: 0; background: #111; }
     .nl-ml-table td { vertical-align: top; }
+    .nl-ml-checkbox { width: 24px; text-align: center; }
     .nl-ml-row-recent { background: rgba(76, 217, 100, 0.08); }
     .nl-ml-row-warm { background: rgba(255, 214, 102, 0.08); }
     .nl-ml-row-stale { background: rgba(255, 77, 77, 0.06); }
@@ -231,6 +232,12 @@ app.registerExtension({
         const localizeAllButton = document.createElement("button");
         localizeAllButton.textContent = "Localize All";
 
+        const localizeSelectedButton = document.createElement("button");
+        localizeSelectedButton.textContent = "Localize Selected";
+
+        const deleteSelectedButton = document.createElement("button");
+        deleteSelectedButton.textContent = "Delete Selected";
+
         const settingsWrap = document.createElement("div");
         settingsWrap.className = "nl-ml-settings";
         const autoLabel = document.createElement("label");
@@ -263,7 +270,16 @@ app.registerExtension({
         const errorLabel = document.createElement("div");
         errorLabel.className = "nl-ml-error";
 
-        bar.append(toggleWrap, refreshButton, localizeAllButton, settingsWrap, cacheLabel, errorLabel);
+        bar.append(
+            toggleWrap,
+            refreshButton,
+            localizeAllButton,
+            localizeSelectedButton,
+            deleteSelectedButton,
+            settingsWrap,
+            cacheLabel,
+            errorLabel
+        );
 
         const tableWrap = document.createElement("div");
         tableWrap.className = "nl-ml-table-wrap";
@@ -274,6 +290,7 @@ app.registerExtension({
         const header = document.createElement("thead");
         header.innerHTML = `
             <tr>
+                <th class="nl-ml-checkbox"><input type="checkbox" class="nl-ml-select-all" /></th>
                 <th>Category</th>
                 <th>Filename</th>
                 <th>Local</th>
@@ -345,6 +362,9 @@ app.registerExtension({
         let currentPage = 1;
         let pageSize = 5;
         let currentSettings = { auto_delete_enabled: false, max_cache_bytes: 0 };
+        let isBusy = false;
+        const selectedKeys = new Set();
+        const selectAllInput = header.querySelector(".nl-ml-select-all");
 
         function setError(message) {
             errorLabel.textContent = message || "";
@@ -353,25 +373,41 @@ app.registerExtension({
         function setMode(mode) {
             currentMode = mode;
             currentPage = 1;
+            selectedKeys.clear();
             workflowButton.classList.toggle("active", mode === "workflow");
             localButton.classList.toggle("active", mode === "local");
-            pagination.style.display = mode === "local" ? "flex" : "none";
-            pageInfo.style.display = mode === "local" ? "inline-flex" : "none";
-            refresh();
+            pagination.style.display = "flex";
+            pageInfo.style.display = "inline-flex";
+            updateSelectionControls();
+            if (!isBusy) {
+                refresh();
+            }
         }
 
-        function setBusy(isBusy) {
-            refreshButton.disabled = isBusy;
-            localizeAllButton.disabled = isBusy;
-            cancelButton.disabled = !isBusy;
-            progressWrap.style.display = isBusy ? "flex" : "none";
+        function setBusy(busyState) {
+            const busy = Boolean(busyState);
+            isBusy = busy;
+            refreshButton.disabled = busy;
+            localizeAllButton.disabled = busy;
+            localizeSelectedButton.disabled = busy;
+            deleteSelectedButton.disabled = busy;
+            workflowButton.disabled = busy;
+            localButton.disabled = busy;
+            pageSizeInput.disabled = busy;
+            selectAllInput.disabled = busy;
+            cancelButton.disabled = !busy;
+            progressWrap.style.display = busy ? "flex" : "none";
             for (const btn of body.querySelectorAll("button")) {
-                btn.disabled = isBusy || btn.dataset.disabled === "true";
+                btn.disabled = busy || btn.dataset.disabled === "true";
+            }
+            for (const checkbox of body.querySelectorAll("input[type='checkbox']")) {
+                checkbox.disabled = busy;
             }
             if (currentMode === "local") {
-                prevButton.disabled = isBusy || currentPage <= 1;
-                nextButton.disabled = isBusy || currentPage >= Math.max(1, Math.ceil(latestData.length / pageSize));
+                prevButton.disabled = busy || currentPage <= 1;
+                nextButton.disabled = busy || currentPage >= Math.max(1, Math.ceil(latestData.length / pageSize));
             }
+            updateSelectionControls();
         }
 
         function updatePagination(totalItems) {
@@ -403,23 +439,25 @@ app.registerExtension({
             body.innerHTML = "";
             const sortedItems = sortItems(items);
             latestData = sortedItems;
+            const allKeys = new Set(sortedItems.map((item) => selectionKey(item)));
+            for (const key of Array.from(selectedKeys)) {
+                if (!allKeys.has(key)) {
+                    selectedKeys.delete(key);
+                }
+            }
 
             let pageItems = sortedItems;
-            if (currentMode === "local") {
-                updatePagination(sortedItems.length);
-                const startIndex = (currentPage - 1) * pageSize;
-                pageItems = sortedItems.slice(startIndex, startIndex + pageSize);
-            }
-            if (currentMode === "workflow") {
-                tableWrap.style.maxHeight = sortedItems.length > 8 ? "260px" : "none";
-            } else {
-                tableWrap.style.maxHeight = "260px";
-            }
+            updatePagination(sortedItems.length);
+            const startIndex = (currentPage - 1) * pageSize;
+            pageItems = sortedItems.slice(startIndex, startIndex + pageSize);
+            tableWrap.style.maxHeight = "none";
+            tableWrap.style.overflow = "visible";
 
             const allSameLastUsed = sortedItems.every(
                 (item) => Number(item.last_used || 0) === Number(sortedItems[0]?.last_used || 0)
             );
             const totalItems = sortedItems.length;
+            updateSelectAllState(pageItems);
 
             for (let index = 0; index < pageItems.length; index += 1) {
                 const item = pageItems[index];
@@ -435,6 +473,23 @@ app.registerExtension({
                         row.classList.add("nl-ml-row-stale");
                     }
                 }
+
+                const selectCell = document.createElement("td");
+                selectCell.className = "nl-ml-checkbox";
+                const selectBox = document.createElement("input");
+                selectBox.type = "checkbox";
+                selectBox.checked = selectedKeys.has(selectionKey(item));
+                selectBox.addEventListener("change", () => {
+                    const key = selectionKey(item);
+                    if (selectBox.checked) {
+                        selectedKeys.add(key);
+                    } else {
+                        selectedKeys.delete(key);
+                    }
+                    updateSelectAllState(pageItems);
+                    updateSelectionControls();
+                });
+                selectCell.appendChild(selectBox);
 
                 const categoryCell = document.createElement("td");
                 categoryCell.textContent = item.category;
@@ -499,14 +554,24 @@ app.registerExtension({
                     localCell.appendChild(localizeButton);
                 }
 
-                row.append(categoryCell, nameCell, localCell, netCell, sizeCell, lastUsedCell);
+                row.append(selectCell, categoryCell, nameCell, localCell, netCell, sizeCell, lastUsedCell);
                 body.appendChild(row);
             }
+
+            requestAnimationFrame(() => {
+                const desired = Math.ceil(root.scrollHeight + 20);
+                if (desired > node.size[1]) {
+                    node.setSize([node.size[0], desired]);
+                }
+            });
+            updateSelectionControls();
         }
 
         async function refresh() {
             setError("");
-            progressText.textContent = currentMode === "workflow" ? "Scanning workflow..." : "Scanning local models...";
+            if (!isBusy) {
+                progressText.textContent = currentMode === "workflow" ? "Scanning workflow..." : "Scanning local models...";
+            }
             try {
                 let response;
                 if (currentMode === "workflow") {
@@ -535,10 +600,14 @@ app.registerExtension({
                     }
                 }
                 renderRows(data.items || []);
-                progressText.textContent = "";
+                if (!isBusy) {
+                    progressText.textContent = "";
+                }
             } catch (err) {
                 setError(err.message || String(err));
-                progressText.textContent = "";
+                if (!isBusy) {
+                    progressText.textContent = "";
+                }
             }
         }
 
@@ -647,6 +716,10 @@ app.registerExtension({
         }
 
         async function startLocalize(items, overwrite) {
+            if (isBusy || currentJobId) {
+                setError("Localization already running.");
+                return;
+            }
             setError("");
             setBusy(true);
             progressText.textContent = "Starting copy...";
@@ -709,6 +782,23 @@ app.registerExtension({
             }
         }
 
+        async function resumeActiveJob() {
+            try {
+                const response = await api.fetchApi("/model_localizer/job");
+                const data = await readJsonOrText(response);
+                if (!response.ok) {
+                    throw new Error(data?.error || data?._raw || response.statusText);
+                }
+                if (data.job_id) {
+                    currentJobId = data.job_id;
+                    setBusy(true);
+                    pollJob();
+                }
+            } catch (err) {
+                setError(err.message || String(err));
+            }
+        }
+
         async function deleteLocal(category, relpath) {
             setError("");
             setBusy(true);
@@ -730,6 +820,69 @@ app.registerExtension({
             } finally {
                 setBusy(false);
             }
+        }
+
+        async function deleteSelected(items) {
+            setError("");
+            setBusy(true);
+            progressText.textContent = "Deleting selected copies...";
+            try {
+                const response = await api.fetchApi("/model_localizer/delete_local_batch", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ items }),
+                });
+                const data = await readJsonOrText(response);
+                if (!response.ok) {
+                    throw new Error(data?.error || data?._raw || response.statusText);
+                }
+                if (data.errors && data.errors.length) {
+                    setError(`Deleted ${data.deleted?.length || 0} with ${data.errors.length} errors`);
+                }
+                await refresh();
+                progressText.textContent = "";
+            } catch (err) {
+                setError(err.message || String(err));
+            } finally {
+                setBusy(false);
+            }
+        }
+
+        function selectionKey(item) {
+            return `${item.category}::${item.relpath}`;
+        }
+
+        function updateSelectAllState(pageItems) {
+            if (!pageItems.length) {
+                selectAllInput.checked = false;
+                selectAllInput.indeterminate = false;
+                return;
+            }
+            const selectedCount = pageItems.reduce(
+                (count, item) => count + (selectedKeys.has(selectionKey(item)) ? 1 : 0),
+                0
+            );
+            selectAllInput.checked = selectedCount === pageItems.length;
+            selectAllInput.indeterminate = selectedCount > 0 && selectedCount < pageItems.length;
+        }
+
+        function getSelectedItems() {
+            return latestData.filter((item) => selectedKeys.has(selectionKey(item)));
+        }
+
+        function updateSelectionControls() {
+            const selectedItems = getSelectedItems();
+            const localizeEligible = selectedItems.filter(
+                (item) => item.network_exists && (!item.local_exists || item.status === "different_size")
+            );
+            const deleteEligible = selectedItems.filter((item) => item.local_exists);
+            localizeSelectedButton.disabled = isBusy || localizeEligible.length === 0;
+            deleteSelectedButton.disabled = isBusy || deleteEligible.length === 0;
+        }
+
+        function currentPageItems() {
+            const startIndex = (currentPage - 1) * pageSize;
+            return latestData.slice(startIndex, startIndex + pageSize);
         }
 
         refreshButton.addEventListener("click", refresh);
@@ -767,7 +920,23 @@ app.registerExtension({
             }
         });
 
+        selectAllInput.addEventListener("change", () => {
+            const pageItems = currentPageItems();
+            if (!pageItems.length) return;
+            if (selectAllInput.checked) {
+                for (const item of pageItems) {
+                    selectedKeys.add(selectionKey(item));
+                }
+            } else {
+                for (const item of pageItems) {
+                    selectedKeys.delete(selectionKey(item));
+                }
+            }
+            renderRows(latestData);
+        });
+
         localizeAllButton.addEventListener("click", () => {
+            if (isBusy) return;
             const items = latestData.filter(
                 (item) => item.network_exists && (!item.local_exists || item.status === "different_size")
             );
@@ -780,6 +949,34 @@ app.registerExtension({
             startLocalize(payloadItems, overwrite);
         });
 
+        localizeSelectedButton.addEventListener("click", () => {
+            if (isBusy) return;
+            const selectedItems = getSelectedItems();
+            const eligible = selectedItems.filter(
+                (item) => item.network_exists && (!item.local_exists || item.status === "different_size")
+            );
+            if (!eligible.length) {
+                setError("No selected models eligible to localize");
+                return;
+            }
+            const overwrite = eligible.some((item) => item.status === "different_size");
+            const payloadItems = eligible.map((item) => ({ category: item.category, relpath: item.relpath }));
+            startLocalize(payloadItems, overwrite);
+        });
+
+        deleteSelectedButton.addEventListener("click", () => {
+            if (isBusy) return;
+            const selectedItems = getSelectedItems();
+            const eligible = selectedItems.filter((item) => item.local_exists);
+            if (!eligible.length) {
+                setError("No selected local models to delete");
+                return;
+            }
+            if (!confirm(`Delete local copies for ${eligible.length} selected models?`)) return;
+            const payloadItems = eligible.map((item) => ({ category: item.category, relpath: item.relpath }));
+            deleteSelected(payloadItems);
+        });
+
         cancelButton.addEventListener("click", async () => {
             if (!currentJobId) return;
             try {
@@ -789,7 +986,9 @@ app.registerExtension({
             }
         });
 
-        setMode("workflow");
-        loadSettings();
+        resumeActiveJob().finally(() => {
+            setMode("workflow");
+            loadSettings();
+        });
     },
 });
