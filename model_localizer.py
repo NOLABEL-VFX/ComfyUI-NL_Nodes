@@ -200,6 +200,15 @@ def _candidate_relpaths(raw: str, category: str) -> list[str]:
     return variants
 
 
+_MODEL_EXTENSIONS = {".safetensors", ".ckpt", ".pt", ".pth", ".bin", ".gguf"}
+
+
+def _is_allowed_model_path(path: str) -> bool:
+    if not path:
+        return False
+    return Path(path).suffix.lower() in _MODEL_EXTENSIONS
+
+
 def _is_within(path: Path, base: Path) -> bool:
     try:
         path_res = path.resolve(strict=False)
@@ -467,6 +476,8 @@ def _prune_cache(max_cache_bytes: int, source: str) -> dict:
             continue
         for root, _, files in os.walk(local_root):
             for name in files:
+                if not _is_allowed_model_path(name):
+                    continue
                 local_path = Path(root) / name
                 size = _file_size(str(local_path))
                 if size is None:
@@ -795,6 +806,8 @@ async def _scan(request):
                 continue
 
             for relpath in _candidate_relpaths(candidate, category):
+                if not _is_allowed_model_path(relpath):
+                    continue
                 local_path = None
                 network_path = None
                 try:
@@ -874,6 +887,8 @@ async def _list_local(request):
 
         for root, _, files in os.walk(local_root):
             for name in files:
+                if not _is_allowed_model_path(name):
+                    continue
                 local_path = Path(root) / name
                 try:
                     relpath = local_path.relative_to(local_root).as_posix()
