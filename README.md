@@ -6,6 +6,16 @@ Custom nodes for ComfyUI maintained by NOLABEL (initially by Wojciech Czub). The
 - Go to your `ComfyUI/custom_nodes` directory and clone or copy this repository into `ComfyUI-NL_Nodes`.
 - Restart ComfyUI. You will find the node under `NOLABEL/Utilities` as "NL Model Manager (Network ↔ Local)".
 
+## NL Workflow
+Provides a single source of workflow metadata (show/shot, resolution, timing, project paths) for studio pipelines. The node emits individual outputs plus a combined `workflow_context` dict for downstream nodes. It lives under `NOLABEL/Workflow` as "NL Workflow".
+
+### Notes
+- Includes a lock toggle and save/load defaults buttons.
+- Defaults are stored in `ComfyUI/user/defaults/nl_workflow.json`.
+
+## NL Context Debug
+Utility node for testing. Reads the cached workflow context (by workflow ID or last run) and outputs a JSON string plus the raw context dict.
+
 ## NL Model Manager (Network ↔ Local)
 Manages model files referenced by the current workflow or the entire local cache, including copy actions from a network models root to a local cache. The node renders a table with status, size, and actions, and includes “Localize All” plus progress with cancel support.
 
