@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
 import os
 import re
 import shutil
@@ -93,13 +95,10 @@ class NLRead:
     def INPUT_TYPES(cls):
         return {
             "required": {
-                "source": ([""], {"default": ""}),
-                "mode": (["auto", "image", "sequence", "video"],),
-                "load": (["preview_only", "frames"],),
+                "source": ("STRING", {"default": ""}),
                 "max_frames": ("INT", {"default": 120, "min": 1, "max": 10000}),
                 "skip_first": ("INT", {"default": 0, "min": 0, "max": 100000}),
                 "every_nth": ("INT", {"default": 1, "min": 1, "max": 1000}),
-                "force_size": (_FORCE_SIZE_OPTIONS,),
             },
             "optional": {
                 "workflow_context": ("NL_WORKFLOW_CONTEXT",),
@@ -112,21 +111,18 @@ class NLRead:
     CATEGORY = "NOLABEL/IO"
 
     @classmethod
-    def IS_CHANGED(cls, source="", mode="auto", **_kwargs):
+    def IS_CHANGED(cls, source="", **_kwargs):
         context = _get_workflow_context(_kwargs.get("workflow_context"))
-        resolved = _resolve_source(source, mode, context)
+        resolved = _resolve_source(source, "auto", context)
         signature = _build_change_signature(resolved)
         return signature
 
     def read(
         self,
         source: str,
-        mode: str,
-        load: str,
         max_frames: int,
         skip_first: int,
         every_nth: int,
-        force_size: str,
         workflow_context: dict | None = None,
     ):
         if torch is None or np is None or Image is None:
@@ -136,16 +132,17 @@ class NLRead:
             return _empty_output()
 
         context = _get_workflow_context(workflow_context)
-        resolved = _resolve_source(source, mode, context)
+        resolved = _resolve_source(source, "auto", context)
         resolved_path = resolved.path
         resolved_mode = resolved.mode
 
         if not resolved_path:
             return _empty_output()
 
-        max_frames = 1 if load == "preview_only" else int(max_frames)
         skip_first = max(0, int(skip_first))
         every_nth = max(1, int(every_nth))
+        max_frames = max(1, int(max_frames))
+        force_size = "Disabled"
 
         if resolved_mode == "image":
             _ensure_safe_path(Path(resolved_path), context)
@@ -320,6 +317,16 @@ def _iter_sequence_files(source: str):
         yield candidate
 
 
+def _sequence_first_and_count(source: str) -> tuple[Path | None, int]:
+    first_frame = None
+    count = 0
+    for path in _iter_sequence_files(source):
+        if first_frame is None:
+            first_frame = path
+        count += 1
+    return first_frame, count
+
+
 def _select_sequence_frames(resolved: _ResolvedSource, skip_first: int, every_nth: int, max_frames: int):
     frames = []
     count = 0
@@ -337,6 +344,35 @@ def _select_sequence_frames(resolved: _ResolvedSource, skip_first: int, every_nt
             break
         index += 1
     return frames
+
+
+def _selected_frame_count(
+    total_frames: int | None, skip_first: int, every_nth: int, max_frames: int
+) -> int | None:
+    if total_frames is None:
+        return None
+    remaining = max(0, total_frames - max(0, skip_first))
+    if remaining <= 0:
+        return 0
+    step = max(1, every_nth)
+    selected = (remaining + step - 1) // step
+    limit = max(0, max_frames)
+    if limit:
+        selected = min(selected, limit)
+    return selected
+
+
+def _first_selected_frame(source: str, skip_first: int, every_nth: int) -> Path | None:
+    index = 0
+    for path in _iter_sequence_files(source):
+        if index < skip_first:
+            index += 1
+            continue
+        if (index - skip_first) % max(1, every_nth) != 0:
+            index += 1
+            continue
+        return path
+    return None
 
 
 def _load_image_tensor(path: Path, force_size: str):
@@ -603,7 +639,154 @@ def _dedupe_path(path: Path) -> Path:
         index += 1
 
 
-def _resolve_preview_info(source: str, mode: str, context: dict | None):
+def _video_stats(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    if iio is None:
+        return _ffprobe_video_stats(path)
+    meta = None
+    try:
+        if hasattr(iio, "immeta"):
+            meta = iio.immeta(str(path))
+        else:
+            reader = iio.get_reader(str(path))
+            try:
+                meta = reader.get_meta_data()
+            finally:
+                reader.close()
+    except Exception:
+        return {}
+    if not isinstance(meta, dict):
+        return {}
+    fps_value = meta.get("fps")
+    if fps_value is None:
+        fps_value = meta.get("frames_per_second")
+    duration_value = meta.get("duration")
+    frame_count = meta.get("nframes")
+    if frame_count is None:
+        frame_count = meta.get("n_frames")
+    fps = None
+    try:
+        fps = float(fps_value)
+        if not math.isfinite(fps) or fps <= 0:
+            fps = None
+    except (TypeError, ValueError):
+        fps = None
+    duration = None
+    try:
+        duration = float(duration_value)
+        if not math.isfinite(duration) or duration <= 0:
+            duration = None
+    except (TypeError, ValueError):
+        duration = None
+    if frame_count is not None:
+        try:
+            frame_count = int(frame_count)
+        except (TypeError, ValueError):
+            frame_count = None
+    if frame_count is None and fps is not None and duration is not None:
+        frame_count = max(1, int(round(fps * duration)))
+    stats = {}
+    if fps is not None:
+        stats["fps"] = fps
+    if frame_count is not None:
+        stats["frame_count"] = frame_count
+    if stats:
+        return stats
+    return _ffprobe_video_stats(path)
+
+
+def _ffprobe_video_stats(path: Path) -> dict:
+    if not _ffmpeg_available():
+        return {}
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=avg_frame_rate,r_frame_rate,nb_frames,duration",
+        "-of",
+        "json",
+        str(path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except Exception:
+        return {}
+    if result.returncode != 0:
+        return {}
+    try:
+        payload = json.loads(result.stdout or "{}")
+    except Exception:
+        return {}
+    streams = payload.get("streams") or []
+    if not streams:
+        return {}
+    stream = streams[0] if isinstance(streams[0], dict) else {}
+    fps = _parse_ffprobe_rate(stream.get("avg_frame_rate")) or _parse_ffprobe_rate(
+        stream.get("r_frame_rate")
+    )
+    frame_count = None
+    raw_frames = stream.get("nb_frames")
+    if raw_frames is not None:
+        try:
+            frame_count = int(raw_frames)
+        except (TypeError, ValueError):
+            frame_count = None
+    duration = None
+    raw_duration = stream.get("duration")
+    if raw_duration is not None:
+        try:
+            duration = float(raw_duration)
+        except (TypeError, ValueError):
+            duration = None
+    if frame_count is None and fps is not None and duration is not None:
+        frame_count = max(1, int(round(fps * duration)))
+    stats = {}
+    if fps is not None:
+        stats["fps"] = fps
+    if frame_count is not None:
+        stats["frame_count"] = frame_count
+    return stats
+
+
+def _parse_ffprobe_rate(value: str | None) -> float | None:
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            parsed = float(value)
+            return parsed if math.isfinite(parsed) and parsed > 0 else None
+        except (TypeError, ValueError):
+            return None
+    if isinstance(value, str) and "/" in value:
+        parts = value.split("/", 1)
+        try:
+            num = float(parts[0])
+            den = float(parts[1])
+        except (TypeError, ValueError):
+            return None
+        if den == 0:
+            return None
+        rate = num / den
+        return rate if math.isfinite(rate) and rate > 0 else None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) and parsed > 0 else None
+
+
+def _resolve_preview_info(
+    source: str,
+    mode: str,
+    context: dict | None,
+    skip_first: int = 0,
+    every_nth: int = 1,
+    max_frames: int = 0,
+):
     resolved = _resolve_source(source, mode, context)
     project_input = _project_input_from_context(context)
     has_context = project_input is not None
@@ -611,6 +794,8 @@ def _resolve_preview_info(source: str, mode: str, context: dict | None):
         return {
             "url": "",
             "kind": "",
+            "mode": resolved.mode,
+            "stats": {},
             "resolved_path": "",
             "has_context": has_context,
             "project_input": str(project_input) if project_input else "",
@@ -618,11 +803,13 @@ def _resolve_preview_info(source: str, mode: str, context: dict | None):
 
     path = Path(resolved.path)
     if resolved.mode == "sequence":
-        first_frame = next(_iter_sequence_files(resolved.path), None)
+        first_frame, frame_count = _sequence_first_and_count(resolved.path)
         if not first_frame:
             return {
                 "url": "",
                 "kind": "",
+                "mode": resolved.mode,
+                "stats": {},
                 "resolved_path": resolved.path,
                 "has_context": has_context,
                 "project_input": str(project_input) if project_input else "",
@@ -632,22 +819,47 @@ def _resolve_preview_info(source: str, mode: str, context: dict | None):
             return {
                 "url": "",
                 "kind": "",
+                "mode": resolved.mode,
+                "stats": {},
                 "resolved_path": resolved.path,
                 "has_context": has_context,
                 "project_input": str(project_input) if project_input else "",
                 "blocked_reason": _blocked_message(has_context),
             }
+        selected_count = _selected_frame_count(frame_count, skip_first, every_nth, max_frames)
+        stats = {"frame_count": frame_count, "selected_frames": selected_count}
+        preview_params = (
+            f"&skip_first={max(0, int(skip_first))}"
+            f"&every_nth={max(1, int(every_nth))}"
+            f"&max_frames={max(0, int(max_frames))}"
+        )
         if _ffmpeg_available():
             return {
-                "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode=sequence&anim=1",
+                "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode=sequence&anim=1{preview_params}",
                 "kind": "video",
+                "mode": resolved.mode,
+                "stats": stats,
                 "resolved_path": resolved.path,
                 "has_context": has_context,
                 "project_input": str(project_input) if project_input else "",
             }
+        first_selected = _first_selected_frame(resolved.path, skip_first, every_nth) or first_frame
+        if first_selected != first_frame and not _is_safe_path(first_selected, context):
+            return {
+                "url": "",
+                "kind": "",
+                "mode": resolved.mode,
+                "stats": stats,
+                "resolved_path": resolved.path,
+                "has_context": has_context,
+                "project_input": str(project_input) if project_input else "",
+                "blocked_reason": _blocked_message(has_context),
+            }
         return {
-            "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode=sequence",
+            "url": f"/nl/viewmedia?source={_quote(str(first_selected))}&mode=image",
             "kind": "image",
+            "mode": resolved.mode,
+            "stats": stats,
             "resolved_path": resolved.path,
             "has_context": has_context,
             "project_input": str(project_input) if project_input else "",
@@ -657,6 +869,8 @@ def _resolve_preview_info(source: str, mode: str, context: dict | None):
         return {
             "url": "",
             "kind": "",
+            "mode": resolved.mode,
+            "stats": {},
             "resolved_path": resolved.path,
             "has_context": has_context,
             "project_input": str(project_input) if project_input else "",
@@ -664,10 +878,22 @@ def _resolve_preview_info(source: str, mode: str, context: dict | None):
         }
 
     if resolved.mode == "video":
-        if path.suffix.lower() not in _BROWSER_VIDEO_EXTS and _ffmpeg_available():
+        stats = _video_stats(path)
+        selected_count = _selected_frame_count(stats.get("frame_count"), skip_first, every_nth, max_frames)
+        if selected_count is not None:
+            stats["selected_frames"] = selected_count
+        preview_params = (
+            f"&skip_first={max(0, int(skip_first))}"
+            f"&every_nth={max(1, int(every_nth))}"
+            f"&max_frames={max(0, int(max_frames))}"
+        )
+        force_transcode = skip_first > 0 or every_nth > 1 or max_frames > 0
+        if (path.suffix.lower() not in _BROWSER_VIDEO_EXTS or force_transcode) and _ffmpeg_available():
             return {
-                "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode=video&transcode=1",
+                "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode=video&transcode=1{preview_params}",
                 "kind": "video",
+                "mode": resolved.mode,
+                "stats": stats,
                 "resolved_path": resolved.path,
                 "has_context": has_context,
                 "project_input": str(project_input) if project_input else "",
@@ -678,6 +904,8 @@ def _resolve_preview_info(source: str, mode: str, context: dict | None):
         return {
             "url": view_url,
             "kind": resolved.mode,
+            "mode": resolved.mode,
+            "stats": stats if resolved.mode == "video" else {},
             "resolved_path": resolved.path,
             "has_context": has_context,
             "project_input": str(project_input) if project_input else "",
@@ -686,6 +914,8 @@ def _resolve_preview_info(source: str, mode: str, context: dict | None):
     return {
         "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode={resolved.mode}",
         "kind": resolved.mode,
+        "mode": resolved.mode,
+        "stats": stats if resolved.mode == "video" else {},
         "resolved_path": resolved.path,
         "has_context": has_context,
         "project_input": str(project_input) if project_input else "",
@@ -730,12 +960,31 @@ def _quote(value: str) -> str:
     return re.sub(r"[^A-Za-z0-9_.~-]", lambda m: "%{:02X}".format(ord(m.group(0))), value)
 
 
+def _safe_int(value: str | None, default: int) -> int:
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def _ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
+def _preview_fps(context: dict | None, fallback: float = 25.0) -> float:
+    if not context or not isinstance(context, dict):
+        return fallback
+    try:
+        fps = float(context.get("fps", fallback))
+    except (TypeError, ValueError):
+        return fallback
+    return fps if fps > 0 else fallback
+
+
 def _build_ffconcat(sequence_paths: list[Path], fps: float) -> str:
-    duration = 1.0 / fps if fps > 0 else 1.0 / 12.0
+    duration = 1.0 / fps if fps > 0 else 1.0 / 25.0
     lines = ["ffconcat version 1.0"]
     for path in sequence_paths:
         lines.append(f"file '{path.as_posix()}'")
@@ -744,12 +993,29 @@ def _build_ffconcat(sequence_paths: list[Path], fps: float) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _iter_sequence_sample(source: str, limit: int = 500) -> list[Path]:
+def _iter_sequence_sample(
+    source: str,
+    limit: int = 500,
+    skip_first: int = 0,
+    every_nth: int = 1,
+    max_frames: int = 0,
+) -> list[Path]:
     frames = []
+    index = 0
+    limit = max(1, int(limit))
+    max_frames = max(0, int(max_frames))
+    effective_limit = min(limit, max_frames) if max_frames else limit
     for path in _iter_sequence_files(source):
+        if index < skip_first:
+            index += 1
+            continue
+        if (index - skip_first) % max(1, every_nth) != 0:
+            index += 1
+            continue
         frames.append(path)
-        if len(frames) >= limit:
+        if len(frames) >= effective_limit:
             break
+        index += 1
     return frames
 
 
@@ -826,8 +1092,11 @@ def _register_routes():
     async def nl_read_resolve(request):
         source = request.rel_url.query.get("source", "")
         mode = request.rel_url.query.get("mode", "auto")
+        skip_first = _safe_int(request.rel_url.query.get("skip_first"), 0)
+        every_nth = _safe_int(request.rel_url.query.get("every_nth"), 1)
+        max_frames = _safe_int(request.rel_url.query.get("max_frames"), 0)
         context = _get_workflow_context(None)
-        payload = _resolve_preview_info(source, mode, context)
+        payload = _resolve_preview_info(source, mode, context, skip_first, every_nth, max_frames)
         return web.json_response(payload)
 
     @routes.get("/nl_read/list")
@@ -874,6 +1143,9 @@ def _register_routes():
         mode = request.rel_url.query.get("mode", "auto")
         anim = request.rel_url.query.get("anim", "0") in {"1", "true", "yes"}
         transcode = request.rel_url.query.get("transcode", "0") in {"1", "true", "yes"}
+        skip_first = _safe_int(request.rel_url.query.get("skip_first"), 0)
+        every_nth = _safe_int(request.rel_url.query.get("every_nth"), 1)
+        max_frames = _safe_int(request.rel_url.query.get("max_frames"), 0)
         context = _get_workflow_context(None)
         resolved = _resolve_source(source, mode, context)
         if not resolved.path:
@@ -887,10 +1159,16 @@ def _register_routes():
             if not _is_safe_path(first_frame, context):
                 raise web.HTTPForbidden()
             if anim and _ffmpeg_available():
-                frames = _iter_sequence_sample(resolved.path, limit=500)
+                frames = _iter_sequence_sample(
+                    resolved.path,
+                    limit=500,
+                    skip_first=skip_first,
+                    every_nth=every_nth,
+                    max_frames=max_frames,
+                )
                 if not frames:
                     raise web.HTTPNotFound()
-                concat_text = _build_ffconcat(frames, fps=12.0)
+                concat_text = _build_ffconcat(frames, fps=_preview_fps(context))
                 temp_root = None
                 if folder_paths is not None:
                     try:
@@ -960,6 +1238,13 @@ def _register_routes():
                 raise web.HTTPForbidden()
             if not path.exists():
                 raise web.HTTPNotFound()
+            vf_parts = []
+            if skip_first > 0 or every_nth > 1:
+                skip_expr = f"gte(n\\,{max(0, int(skip_first))})"
+                step = max(1, int(every_nth))
+                mod_expr = f"not(mod(n-{max(0, int(skip_first))}\\,{step}))"
+                vf_parts.append(f"select='{skip_expr}*{mod_expr}'")
+                vf_parts.append("setpts=N/FRAME_RATE/TB")
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
@@ -968,6 +1253,8 @@ def _register_routes():
                 "-i",
                 str(path),
                 "-an",
+                *(["-vf", ",".join(vf_parts)] if vf_parts else []),
+                *(["-frames:v", str(max_frames)] if max_frames > 0 else []),
                 "-c:v",
                 "libx264",
                 "-preset",

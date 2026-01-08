@@ -56,6 +56,24 @@ function ensureStyles() {
         .nl-read-preview.is-video video {
             display: block;
         }
+        .nl-read-stats {
+            width: 100%;
+            min-height: 24px;
+            padding: 4px 6px;
+            box-sizing: border-box;
+            background: #0b0b0b;
+            color: #9ca3af;
+            border: 1px solid #1f2937;
+            border-radius: 6px;
+            font-size: 11px;
+            line-height: 1.35;
+            white-space: normal;
+            word-break: break-word;
+            display: block;
+            height: auto;
+            overflow: visible;
+            margin-bottom: 10px;
+        }
     `;
     document.head.appendChild(style);
 }
@@ -74,8 +92,36 @@ function insertWidgetBefore(node, targetName, widget) {
     widgets.splice(targetIndex, 0, widget);
 }
 
+function ensureComboWidget(node, widget) {
+    if (!widget) return null;
+    if (widget.type === "combo") {
+        widget.options = widget.options || {};
+        widget.options.values = widget.options.values || [widget.value || ""];
+        return widget;
+    }
+    const widgetIndex = (node.widgets || []).indexOf(widget);
+    if (widgetIndex === -1) return widget;
+    const values = widget.options?.values || [widget.value || ""];
+    const newWidget = node.addWidget("combo", widget.name, widget.value || "", () => {}, { values });
+    newWidget.options = { ...(widget.options || {}), values };
+    newWidget.serialize = widget.serialize;
+    newWidget.options.canvasOnly = widget.options?.canvasOnly ?? newWidget.options?.canvasOnly;
+    const newIndex = (node.widgets || []).indexOf(newWidget);
+    if (newIndex !== -1) {
+        node.widgets.splice(newIndex, 1);
+    }
+    node.widgets.splice(widgetIndex, 1, newWidget);
+    return newWidget;
+}
+
 function attachPreview(node) {
     ensureStyles();
+
+    const basename = (value) => {
+        if (!value) return "";
+        const parts = value.split(/[\\/]/);
+        return parts[parts.length - 1] || value;
+    };
 
     const controls = document.createElement("div");
     controls.className = "nl-read-controls";
@@ -144,12 +190,114 @@ function attachPreview(node) {
     const widget = node.addDOMWidget("videopreview", "videopreview", container, { serialize: false });
     widget.serialize = false;
     widget.options.canvasOnly = false;
+    const stats = document.createElement("div");
+    stats.className = "nl-read-stats";
+    stats.textContent = "No preview.";
+    const statsWidget = node.addDOMWidget("preview_stats", "preview_stats", stats, { serialize: false });
+    statsWidget.serialize = false;
+    statsWidget.options.canvasOnly = false;
+    const baseNodeHeight = Math.max(node.size[1], 540);
+    const statsMetrics = { lastHeight: 28 };
+    const statsSpacing = 10;
+    const measureStatsHeight = (width) => {
+        const targetWidth = width || node.size[0] || 300;
+        const previousWidth = stats.style.width;
+        stats.style.width = `${targetWidth}px`;
+        stats.style.height = "auto";
+        const measured = stats.scrollHeight || stats.getBoundingClientRect().height || 0;
+        const height = Math.max(24, measured + 2 + statsSpacing);
+        stats.style.width = previousWidth;
+        return height;
+    };
+    const syncStatsHeight = () => {
+        const desired = measureStatsHeight(node.size[0]);
+        if (desired === statsMetrics.lastHeight) return;
+        const delta = desired - statsMetrics.lastHeight;
+        const nextHeight = Math.max(baseNodeHeight, node.size[1] + delta);
+        statsMetrics.lastHeight = desired;
+        if (nextHeight !== node.size[1]) {
+            node.setSize([node.size[0], nextHeight]);
+            node.setDirtyCanvas(true, true);
+        }
+    };
+    statsWidget.computeSize = (width) => [width, measureStatsHeight(width)];
     if (node.size[1] < 540) {
         node.setSize([node.size[0], 540]);
     }
 
     let lastResolve = null;
-    const sourceWidget = findWidget(node, "source");
+    let sourceWidget = ensureComboWidget(node, findWidget(node, "source"));
+    const statsState = {
+        mode: "",
+        kind: "",
+        frameCount: null,
+        fps: null,
+        selectedFrames: null,
+        width: null,
+        height: null,
+        duration: null,
+        path: "",
+    };
+
+    const updateStatsDisplay = () => {
+        const mode = statsState.mode || statsState.kind;
+        if (!mode) {
+            stats.textContent = "No preview.";
+            requestAnimationFrame(syncStatsHeight);
+            return;
+        }
+        const label =
+            mode === "sequence" ? "Sequence" : mode === "video" ? "Video" : mode === "image" ? "Image" : "Media";
+        const parts = [label];
+        if (statsState.width && statsState.height) {
+            parts.push(`${statsState.width}x${statsState.height}`);
+        }
+        if (mode === "sequence" && Number.isFinite(statsState.frameCount)) {
+            parts.push(`${statsState.frameCount} frames`);
+            if (
+                Number.isFinite(statsState.selectedFrames) &&
+                statsState.selectedFrames !== statsState.frameCount
+            ) {
+                parts.push(`selected ${statsState.selectedFrames}`);
+            }
+        }
+        if (mode === "video") {
+            if (Number.isFinite(statsState.fps)) {
+                parts.push(`${statsState.fps.toFixed(2)} fps`);
+            }
+            if (Number.isFinite(statsState.frameCount)) {
+                parts.push(`${statsState.frameCount} frames`);
+            }
+            if (
+                Number.isFinite(statsState.selectedFrames) &&
+                Number.isFinite(statsState.frameCount) &&
+                statsState.selectedFrames !== statsState.frameCount
+            ) {
+                parts.push(`selected ${statsState.selectedFrames}`);
+            }
+        }
+        if (mode === "video" && Number.isFinite(statsState.duration)) {
+            parts.push(`${statsState.duration.toFixed(2)}s`);
+        }
+        if (statsState.path) {
+            parts.push(basename(statsState.path));
+        }
+        stats.textContent = parts.join(" | ");
+        requestAnimationFrame(syncStatsHeight);
+    };
+
+    img.addEventListener("load", () => {
+        statsState.width = img.naturalWidth || null;
+        statsState.height = img.naturalHeight || null;
+        updateStatsDisplay();
+    });
+
+    video.addEventListener("loadedmetadata", () => {
+        statsState.width = video.videoWidth || null;
+        statsState.height = video.videoHeight || null;
+        statsState.duration = Number.isFinite(video.duration) ? video.duration : null;
+        updateStatsDisplay();
+    });
 
     const refreshList = async () => {
         const root = rootSelect.value || "input";
@@ -162,7 +310,8 @@ function attachPreview(node) {
             return;
         }
         const payload = await response.json();
-        const entries = (payload?.items || []).map((item) => item.path);
+        const items = payload?.items || [];
+        const entries = items.map((item) => item.path);
         if (!sourceWidget) {
             return;
         }
@@ -180,11 +329,14 @@ function attachPreview(node) {
 
     const updatePreview = async () => {
         const sourceWidget = findWidget(node, "source");
-        const modeWidget = findWidget(node, "mode");
         const source = sourceWidget?.value || "";
-        const mode = modeWidget?.value || "auto";
+        const skipFirst = Math.max(0, Number(findWidget(node, "skip_first")?.value || 0));
+        const everyNth = Math.max(1, Number(findWidget(node, "every_nth")?.value || 1));
+        const maxFrames = Math.max(0, Number(findWidget(node, "max_frames")?.value || 0));
 
-        const url = `/nl_read/resolve?source=${encodeURIComponent(source)}&mode=${encodeURIComponent(mode)}`;
+        const url = `/nl_read/resolve?source=${encodeURIComponent(source)}&mode=auto&skip_first=${encodeURIComponent(
+            skipFirst
+        )}&every_nth=${encodeURIComponent(everyNth)}&max_frames=${encodeURIComponent(maxFrames)}`;
         const response = await api.fetchApi(url);
         if (!response.ok) {
             return;
@@ -194,11 +346,30 @@ function attachPreview(node) {
         const previewUrl = payload?.url || "";
         const kind = payload?.kind || "image";
         const blockedReason = payload?.blocked_reason || "";
+        statsState.mode = payload?.mode || kind;
+        statsState.kind = kind;
+        statsState.frameCount = payload?.stats?.frame_count ?? null;
+        statsState.fps = payload?.stats?.fps ?? null;
+        statsState.selectedFrames = payload?.stats?.selected_frames ?? null;
+        statsState.width = null;
+        statsState.height = null;
+        statsState.duration = null;
+        statsState.path = payload?.resolved_path || source;
 
         if (!previewUrl) {
             container.classList.remove("is-image", "is-video");
             img.removeAttribute("src");
             video.removeAttribute("src");
+            statsState.mode = "";
+            statsState.kind = "";
+            statsState.frameCount = null;
+            statsState.fps = null;
+            statsState.selectedFrames = null;
+            statsState.width = null;
+            statsState.height = null;
+            statsState.duration = null;
+            statsState.path = "";
+            updateStatsDisplay();
             if (blockedReason) {
                 message.textContent = blockedReason;
                 message.style.display = "block";
@@ -224,6 +395,7 @@ function attachPreview(node) {
         }
         message.textContent = "";
         message.style.display = "none";
+        updateStatsDisplay();
     };
 
     if (sourceWidget) {
@@ -236,10 +408,11 @@ function attachPreview(node) {
         };
     }
 
-    const modeWidget = findWidget(node, "mode");
-    if (modeWidget) {
-        const original = modeWidget.callback;
-        modeWidget.callback = function () {
+    for (const widgetName of ["skip_first", "every_nth", "max_frames"]) {
+        const widget = findWidget(node, widgetName);
+        if (!widget) continue;
+        const original = widget.callback;
+        widget.callback = function () {
             if (typeof original === "function") {
                 original.apply(this, arguments);
             }
