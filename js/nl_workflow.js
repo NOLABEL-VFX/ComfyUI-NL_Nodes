@@ -129,6 +129,61 @@ function attachLockHandler(node) {
     applyLockState(node, Boolean(lockWidget.value));
 }
 
+function insertWidgetAfter(node, targetName, widget) {
+    const widgets = node.widgets || [];
+    const targetIndex = widgets.findIndex((item) => item?.name === targetName);
+    if (targetIndex === -1) return;
+    const widgetIndex = widgets.indexOf(widget);
+    if (widgetIndex === -1) return;
+    widgets.splice(widgetIndex, 1);
+    widgets.splice(targetIndex + 1, 0, widget);
+}
+
+function notifyUser(message) {
+    if (app?.ui?.showToast) {
+        app.ui.showToast(message);
+        return;
+    }
+    if (window?.alert) {
+        window.alert(message);
+    }
+}
+
+function refreshAllNLReadNodes() {
+    const callbacks = window?.__nlReadRefreshCallbacks;
+    if (!callbacks || typeof callbacks.forEach !== "function") return;
+    callbacks.forEach((callback) => {
+        try {
+            callback();
+        } catch (err) {
+            console.warn("[NL Workflow] Failed to refresh NL Read node", err);
+        }
+    });
+}
+
+async function populateCache(node) {
+    const payload = collectDefaults(node);
+    const response = await api.fetchApi("/nl_workflow/populate_cache", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+    });
+    if (!response.ok) {
+        console.warn("[NL Workflow] Failed to populate cache");
+        notifyUser("NL Workflow: populate cache failed.");
+        return;
+    }
+    const result = await response.json();
+    if (!result?.ok) {
+        console.warn("[NL Workflow] Populate cache error:", result?.error);
+        notifyUser(result?.error || "NL Workflow: populate cache failed.");
+        return;
+    }
+    // Silent success to avoid toast spam on auto-apply.
+    window.dispatchEvent(new CustomEvent("nl-workflow-cache-updated"));
+    refreshAllNLReadNodes();
+}
+
 app.registerExtension({
     name: EXTENSION_NAME,
     async beforeRegisterNodeDef(nodeType, nodeData) {
@@ -188,7 +243,10 @@ app.registerExtension({
             if (nodeData?.name === NODE_NAME) {
                 this.addWidget("button", "Save Defaults", "", () => saveDefaults(this));
                 this.addWidget("button", "Load Defaults", "", () => loadDefaults(this));
+                const cacheWidget = this.addWidget("button", "Apply Cache", "", () => populateCache(this));
+                insertWidgetAfter(this, "project_path", cacheWidget);
                 attachLockHandler(this);
+                setTimeout(() => populateCache(this), 0);
             }
             return result;
         };

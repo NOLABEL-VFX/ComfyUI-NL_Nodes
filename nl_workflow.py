@@ -325,6 +325,75 @@ def get_workflow_context(workflow_id: str | None = None) -> dict | None:
     return None
 
 
+def _build_cache_context(payload: dict) -> dict:
+    warnings = []
+    project = _coalesce_text(payload.get("project", ""), None)
+    episode = _coalesce_text(payload.get("episode", ""), None)
+    scene = _coalesce_text(payload.get("scene", ""), None)
+    shot = _coalesce_text(payload.get("shot", ""), None)
+    project_path = _sanitize_path(_coalesce_text(payload.get("project_path", ""), None))
+
+    if not project_path:
+        warnings.append("Project path is empty.")
+
+    width = _safe_int(payload.get("width"), 0)
+    height = _safe_int(payload.get("height"), 0)
+    fps = _safe_float(payload.get("fps"), 0.0)
+    frame_start = _safe_int(payload.get("frame_start"), 0)
+    frame_end = _safe_int(payload.get("frame_end"), 0)
+
+    if width <= 0 or height <= 0:
+        warnings.append("Resolution must be positive.")
+    if fps <= 0:
+        warnings.append("FPS should be positive.")
+    if frame_end and frame_end < frame_start:
+        warnings.append("Frame range end is before start.")
+
+    frame_count = max(0, frame_end - frame_start + 1) if frame_end and frame_start else None
+
+    return {
+        "workflow_id": str(uuid.uuid4()),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "generated_at_epoch": time.time(),
+        "project": project or None,
+        "episode": episode or None,
+        "scene": scene or None,
+        "shot": shot or None,
+        "resolution": (width, height),
+        "fps": fps,
+        "frame_range": (frame_start, frame_end),
+        "frame_count": frame_count,
+        "project_path": project_path or None,
+        "note": payload.get("note"),
+        "warnings": warnings,
+    }
+
+
+def _safe_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_float(value, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def populate_cache_from_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {"ok": False, "error": "Invalid payload."}
+    context = _build_cache_context(payload)
+    if not context.get("project_path"):
+        return {"ok": False, "error": "Project path is empty."}
+    _cache_context(context)
+    _emit_warnings(context.get("warnings") or [])
+    return {"ok": True, "context": context}
+
+
 async def _handle_get_defaults(request):
     return web.json_response(_read_defaults())
 
@@ -355,6 +424,14 @@ def _register_routes():
     @routes.post("/nl_workflow/defaults")
     async def set_defaults(request):
         return await _handle_set_defaults(request)
+
+    @routes.post("/nl_workflow/populate_cache")
+    async def populate_cache(request):
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        return web.json_response(populate_cache_from_payload(payload))
 
     app = PromptServer.instance.app
     app.add_routes(routes)
