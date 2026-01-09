@@ -27,6 +27,8 @@ except Exception:  # pragma: no cover
 _ROUTES_REGISTERED = False
 _DEFAULTS_FILENAME = "nl_workflow.json"
 _DEFAULTS_SUBDIR = "defaults"
+_HISTORY_FILENAME = "nl_workflow_history.json"
+_HISTORY_LIMIT = 12
 _WORKFLOW_CONTEXT_CACHE: dict[str, dict] = {}
 _LAST_WORKFLOW_ID: str | None = None
 
@@ -67,14 +69,12 @@ class NLWorkflow:
         "INT",
         "FLOAT",
         "STRING",
-        "NL_WORKFLOW_CONTEXT",
     )
     RETURN_NAMES = (
         "width",
         "height",
         "fps",
         "project_path",
-        "workflow_context",
     )
     FUNCTION = "build_context"
     CATEGORY = "NOLABEL/Workflow"
@@ -152,7 +152,6 @@ class NLWorkflow:
             height,
             fps,
             project_path or "",
-            context,
         )
 
 
@@ -161,30 +160,26 @@ class NLContextDebug:
     def INPUT_TYPES(cls):
         return {
             "optional": {
-                "workflow_context": ("NL_WORKFLOW_CONTEXT",),
                 "workflow_id": ("STRING", {"default": ""}),
                 "use_last": ("BOOLEAN", {"default": True}),
                 "print_to_console": ("BOOLEAN", {"default": True}),
             }
         }
 
-    RETURN_TYPES = ("STRING", "NL_WORKFLOW_CONTEXT")
-    RETURN_NAMES = ("context_json", "workflow_context")
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("context_json",)
     FUNCTION = "debug_context"
     CATEGORY = "NOLABEL/Workflow"
     OUTPUT_NODE = True
 
     def debug_context(
         self,
-        workflow_context: dict | None = None,
         workflow_id: str = "",
         use_last: bool = True,
         print_to_console: bool = True,
     ):
-        context = workflow_context if isinstance(workflow_context, dict) and workflow_context else None
-        if context is None:
-            lookup_id = workflow_id.strip() if workflow_id else None
-            context = get_workflow_context(lookup_id if lookup_id or not use_last else None)
+        lookup_id = workflow_id.strip() if workflow_id else None
+        context = get_workflow_context(lookup_id if lookup_id or not use_last else None)
         if context is None:
             payload = {"error": "No workflow context found."}
         else:
@@ -195,7 +190,89 @@ class NLContextDebug:
             serialized = json.dumps({"error": "Failed to serialize context."})
         if print_to_console:
             print(f"[comfyui-nlnodes] NL Context Debug:\n{serialized}")
-        return {"ui": {"context_json": [serialized]}, "result": (serialized, context or {})}
+        return {"ui": {"context_json": [serialized]}, "result": (serialized,)}
+
+
+class NLWorkflowResolution:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ("INT", "INT")
+    RETURN_NAMES = ("width", "height")
+    FUNCTION = "get_resolution"
+    CATEGORY = "NOLABEL/Workflow"
+
+    @classmethod
+    def IS_CHANGED(cls):
+        context = get_workflow_context()
+        if not isinstance(context, dict):
+            return "no-context"
+        return f"{context.get('workflow_id')}:{context.get('generated_at_epoch')}"
+
+    def get_resolution(self):
+        context = get_workflow_context()
+        width = 0
+        height = 0
+        if isinstance(context, dict):
+            resolution = context.get("resolution")
+            if isinstance(resolution, (list, tuple)) and len(resolution) >= 2:
+                width = int(resolution[0]) if resolution[0] is not None else 0
+                height = int(resolution[1]) if resolution[1] is not None else 0
+        return width, height
+
+
+class NLWorkflowFPS:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ("FLOAT",)
+    RETURN_NAMES = ("fps",)
+    FUNCTION = "get_fps"
+    CATEGORY = "NOLABEL/Workflow"
+
+    @classmethod
+    def IS_CHANGED(cls):
+        context = get_workflow_context()
+        if not isinstance(context, dict):
+            return "no-context"
+        return f"{context.get('workflow_id')}:{context.get('generated_at_epoch')}"
+
+    def get_fps(self):
+        context = get_workflow_context()
+        fps = 0.0
+        if isinstance(context, dict):
+            try:
+                fps = float(context.get("fps", 0.0))
+            except Exception:
+                fps = 0.0
+        return (fps,)
+
+
+class NLWorkflowProjectPath:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {}}
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("project_path",)
+    FUNCTION = "get_project_path"
+    CATEGORY = "NOLABEL/Workflow"
+
+    @classmethod
+    def IS_CHANGED(cls):
+        context = get_workflow_context()
+        if not isinstance(context, dict):
+            return "no-context"
+        return f"{context.get('workflow_id')}:{context.get('generated_at_epoch')}"
+
+    def get_project_path(self):
+        context = get_workflow_context()
+        project_path = ""
+        if isinstance(context, dict):
+            project_path = context.get("project_path") or ""
+        return (str(project_path),)
 
 
 def _coalesce_text(value: str | None, fallback: str | None) -> str:
@@ -262,6 +339,104 @@ def _defaults_path() -> Path:
     return path / _DEFAULTS_FILENAME
 
 
+def _history_path() -> Path:
+    if folder_paths is not None:
+        base = Path(folder_paths.get_user_directory())
+    else:
+        base = Path(os.getcwd()) / "user"
+    path = base / _DEFAULTS_SUBDIR
+    path.mkdir(parents=True, exist_ok=True)
+    return path / _HISTORY_FILENAME
+
+
+def _read_history() -> dict:
+    path = _history_path()
+    if not path.exists():
+        return {"ok": True, "data": [], "path": str(path)}
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except Exception as exc:  # pragma: no cover - IO guard
+        return {"ok": False, "error": str(exc), "path": str(path)}
+    if not isinstance(data, list):
+        data = []
+    return {"ok": True, "data": data, "path": str(path)}
+
+
+def _write_history(items: list[dict]) -> dict:
+    path = _history_path()
+    try:
+        with path.open("w", encoding="utf-8") as handle:
+            json.dump(items, handle, indent=2, sort_keys=True)
+    except Exception as exc:  # pragma: no cover - IO guard
+        return {"ok": False, "error": str(exc), "path": str(path)}
+    return {"ok": True, "path": str(path)}
+
+
+def _history_entry_from_context(context: dict) -> dict:
+    return {
+        "id": str(uuid.uuid4()),
+        "saved_at": datetime.now(timezone.utc).isoformat(),
+        "saved_at_epoch": time.time(),
+        "project": context.get("project"),
+        "episode": context.get("episode"),
+        "scene": context.get("scene"),
+        "shot": context.get("shot"),
+        "resolution": context.get("resolution"),
+        "fps": context.get("fps"),
+        "project_path": context.get("project_path"),
+        "note": context.get("note"),
+    }
+
+
+def _history_signature(entry: dict) -> tuple:
+    return (
+        entry.get("project"),
+        entry.get("episode"),
+        entry.get("scene"),
+        entry.get("shot"),
+        entry.get("project_path"),
+        tuple(entry.get("resolution") or ()),
+        entry.get("fps"),
+    )
+
+
+def _append_history_from_context(context: dict) -> None:
+    if not isinstance(context, dict):
+        return
+    entry = _history_entry_from_context(context)
+    snapshot = _read_history()
+    items = snapshot.get("data") if snapshot.get("ok") else []
+    if not isinstance(items, list):
+        items = []
+    signature = _history_signature(entry)
+    deduped = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if _history_signature(item) == signature:
+            continue
+        deduped.append(item)
+    deduped.insert(0, entry)
+    deduped = deduped[:_HISTORY_LIMIT]
+    _write_history(deduped)
+
+
+def _delete_history_entry(entry_id: str) -> dict:
+    snapshot = _read_history()
+    if not snapshot.get("ok"):
+        return snapshot
+    items = snapshot.get("data") or []
+    if not isinstance(items, list):
+        items = []
+    filtered = [item for item in items if isinstance(item, dict) and item.get("id") != entry_id]
+    return _write_history(filtered)
+
+
+def _clear_history() -> dict:
+    return _write_history([])
+
+
 def _write_defaults(payload: dict) -> dict:
     path = _defaults_path()
     try:
@@ -282,6 +457,22 @@ def _read_defaults() -> dict:
     except Exception as exc:  # pragma: no cover - IO guard
         return {"ok": False, "error": str(exc), "path": str(path)}
     return {"ok": True, "data": data or {}, "path": str(path)}
+
+
+def _clear_cache() -> None:
+    global _WORKFLOW_CONTEXT_CACHE, _LAST_WORKFLOW_ID
+    _WORKFLOW_CONTEXT_CACHE = {}
+    _LAST_WORKFLOW_ID = None
+
+
+def _reset_defaults() -> dict:
+    path = _defaults_path()
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception as exc:  # pragma: no cover - IO guard
+        return {"ok": False, "error": str(exc), "path": str(path)}
+    return {"ok": True, "path": str(path)}
 
 
 def _emit_warnings(warnings: list[str]) -> None:
@@ -380,6 +571,52 @@ async def _handle_set_defaults(request):
     return web.json_response(_write_defaults(payload))
 
 
+async def _handle_reset_defaults(request):
+    _clear_cache()
+    return web.json_response(_reset_defaults())
+
+
+async def _handle_clear_cache(request):
+    _clear_cache()
+    return web.json_response({"ok": True})
+
+
+async def _handle_get_history(request):
+    return web.json_response(_read_history())
+
+
+async def _handle_delete_history(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    entry_id = str(payload.get("id") or "")
+    if not entry_id:
+        return web.json_response({"ok": False, "error": "Missing id."}, status=400)
+    result = _delete_history_entry(entry_id)
+    status = 200 if result.get("ok") else 400
+    return web.json_response(result, status=status)
+
+
+async def _handle_clear_history(request):
+    result = _clear_history()
+    status = 200 if result.get("ok") else 400
+    return web.json_response(result, status=status)
+
+
+async def _handle_commit_history(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    context = _build_cache_context(payload)
+    if not context.get("project_path"):
+        return web.json_response({"ok": False, "error": "Project path is empty."}, status=400)
+    _append_history_from_context(context)
+    return web.json_response({"ok": True})
+
 def _register_routes():
     global _ROUTES_REGISTERED
     if _ROUTES_REGISTERED:
@@ -398,6 +635,30 @@ def _register_routes():
     @routes.post("/nl_workflow/defaults")
     async def set_defaults(request):
         return await _handle_set_defaults(request)
+
+    @routes.get("/nl_workflow/history")
+    async def get_history(request):
+        return await _handle_get_history(request)
+
+    @routes.post("/nl_workflow/history/delete")
+    async def delete_history(request):
+        return await _handle_delete_history(request)
+
+    @routes.post("/nl_workflow/history/clear")
+    async def clear_history(request):
+        return await _handle_clear_history(request)
+
+    @routes.post("/nl_workflow/history/commit")
+    async def commit_history(request):
+        return await _handle_commit_history(request)
+
+    @routes.post("/nl_workflow/reset")
+    async def reset_defaults(request):
+        return await _handle_reset_defaults(request)
+
+    @routes.post("/nl_workflow/clear_cache")
+    async def clear_cache(request):
+        return await _handle_clear_cache(request)
 
     @routes.post("/nl_workflow/populate_cache")
     async def populate_cache(request):

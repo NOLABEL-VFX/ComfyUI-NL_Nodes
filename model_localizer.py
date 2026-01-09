@@ -52,11 +52,12 @@ _USAGE_PATH = _user_data_dir() / "model_localizer_usage.json"
 _ACTION_LOG_PATH = _user_data_dir() / "model_localizer_actions.log"
 _USAGE_DEFAULTS = {"auto_delete_enabled": False, "max_cache_bytes": 200 * 1024 ** 3}
 _usage_lock = threading.Lock()
+_routes_registering = False
 
 
 class ModelLocalizer:
     def __init__(self):
-        _register_routes()
+        _ensure_routes_registered()
 
     @classmethod
     def INPUT_TYPES(cls):
@@ -349,6 +350,15 @@ def _format_action_entry(entry: dict) -> list[str]:
             f"[{timestamp}] Localize{source_text}: {category}/{relpath} ({size}, overwrite: {overwrite})"
         ]
 
+    if action == "upload":
+        category = entry.get("category") or "unknown"
+        relpath = entry.get("relpath") or "unknown"
+        size = _human_size(entry.get("bytes"))
+        overwrite = "yes" if entry.get("overwrite") else "no"
+        return [
+            f"[{timestamp}] Upload{source_text}: {category}/{relpath} ({size}, overwrite: {overwrite})"
+        ]
+
     if action == "delete_local":
         category = entry.get("category") or "unknown"
         relpath = entry.get("relpath") or "unknown"
@@ -423,7 +433,7 @@ def _record_usage(items: list[dict], kind: str) -> None:
             if kind == "workflow":
                 entry["workflow_hits"] = int(entry.get("workflow_hits", 0)) + 1
                 entry["last_seen"] = now
-            elif kind == "localize":
+            elif kind in ("localize", "upload"):
                 entry["localize_hits"] = int(entry.get("localize_hits", 0)) + 1
                 entry["last_localize"] = now
                 entry["last_seen"] = now
@@ -541,7 +551,7 @@ class _JobManager:
         self._jobs: dict[str, dict] = {}
         self._executor = ThreadPoolExecutor(max_workers=1)
 
-    def create_job(self, items: list[dict], overwrite: bool) -> str:
+    def create_job(self, items: list[dict], overwrite: bool, direction: str = "localize") -> str:
         job_id = str(uuid.uuid4())
         job = {
             "id": job_id,
@@ -549,6 +559,7 @@ class _JobManager:
             "state": "queued",
             "items": items,
             "overwrite": overwrite,
+            "direction": direction,
             "bytes_done": 0,
             "bytes_total": 0,
             "current_item": None,
@@ -613,6 +624,12 @@ class _JobManager:
 
         items = job.get("items", [])
         overwrite = bool(job.get("overwrite"))
+        direction = job.get("direction") or "localize"
+        if direction not in ("localize", "upload"):
+            self._update(job_id, state="error", message=f"Unknown job direction: {direction}")
+            return
+
+        verbing = "Copying" if direction == "localize" else "Uploading"
 
         to_copy = []
         total_bytes = 0
@@ -638,21 +655,26 @@ class _JobManager:
             except Exception:
                 continue
 
-            if not network_path.exists():
+            if direction == "localize":
+                source_path = network_path
+                dest_path = local_path
+            else:
+                source_path = local_path
+                dest_path = network_path
+
+            if not _path_exists(source_path):
+                missing_label = "Network" if direction == "localize" else "Local"
                 self._update(
                     job_id,
                     state="error",
-                    message=f"Network file missing: {category}/{relpath}",
+                    message=f"{missing_label} file missing: {category}/{relpath}",
                 )
                 return
 
-            network_size = _file_size(str(network_path))
-            local_exists = _path_exists(local_path)
-            local_size = _file_size(str(local_path)) if local_exists else None
-            if local_size is not None and network_size is not None and local_size == network_size and not overwrite:
-                continue
-
-            if network_size is None:
+            source_size = _file_size(str(source_path))
+            dest_exists = _path_exists(dest_path)
+            dest_size = _file_size(str(dest_path)) if dest_exists else None
+            if source_size is None:
                 self._update(
                     job_id,
                     state="error",
@@ -660,12 +682,16 @@ class _JobManager:
                 )
                 return
 
-            total_bytes += network_size
-            to_copy.append((category, relpath, local_path, network_path, network_size))
+            if dest_size is not None and dest_size == source_size and not overwrite:
+                continue
+
+            total_bytes += source_size
+            to_copy.append((category, relpath, source_path, dest_path, source_size))
 
         if not to_copy:
-            self._update(job_id, state="done", bytes_total=0, message="Nothing to localize")
-            print(f"[NL Model Localizer] Job {job_id} nothing to localize", flush=True)
+            message = "Nothing to localize" if direction == "localize" else "Nothing to upload"
+            self._update(job_id, state="done", bytes_total=0, message=message)
+            print(f"[NL Model Localizer] Job {job_id} {message.lower()}", flush=True)
             return
 
         self._update(job_id, bytes_total=total_bytes, bytes_done=0)
@@ -678,7 +704,7 @@ class _JobManager:
         copied_items = []
         last_log_time = time.monotonic()
         last_percent = -1
-        for category, relpath, local_path, network_path, network_size in to_copy:
+        for category, relpath, source_path, dest_path, copy_size in to_copy:
             if self._is_cancelled(job_id):
                 self._update(job_id, state="cancelled", message="Cancelled", current_item=None)
                 print(f"[NL Model Localizer] Job {job_id} cancelled", flush=True)
@@ -687,17 +713,17 @@ class _JobManager:
             self._update(
                 job_id,
                 current_item={"category": category, "relpath": relpath},
-                message=f"Copying {category}/{relpath}",
+                message=f"{verbing} {category}/{relpath}",
             )
             print(
-                f"[NL Model Localizer] Job {job_id} copying {category}/{relpath} ({_human_size(network_size)})",
+                f"[NL Model Localizer] Job {job_id} {verbing.lower()} {category}/{relpath} ({_human_size(copy_size)})",
                 flush=True,
             )
 
-            temp_path = Path(f"{local_path}.partial.{job_id}")
+            temp_path = Path(f"{dest_path}.partial.{job_id}")
             try:
-                os.makedirs(local_path.parent, exist_ok=True)
-                with open(network_path, "rb") as src, open(temp_path, "wb") as dst:
+                os.makedirs(dest_path.parent, exist_ok=True)
+                with open(source_path, "rb") as src, open(temp_path, "wb") as dst:
                     while True:
                         if self._is_cancelled(job_id):
                             raise RuntimeError("Cancelled")
@@ -723,14 +749,14 @@ class _JobManager:
                             )
                     dst.flush()
                     os.fsync(dst.fileno())
-                os.replace(temp_path, local_path)
+                os.replace(temp_path, dest_path)
                 _log_action(
-                    "localize",
+                    "localize" if direction == "localize" else "upload",
                     {
                         "source": "manual",
                         "category": category,
                         "relpath": relpath,
-                        "bytes": network_size,
+                        "bytes": copy_size,
                         "overwrite": overwrite,
                     },
                 )
@@ -749,27 +775,31 @@ class _JobManager:
                 print(f"[NL Model Localizer] Job {job_id} error: {exc}", flush=True)
                 return
 
-        _record_usage(copied_items, "localize")
+        _record_usage(copied_items, direction)
 
-        settings = _usage_snapshot()[1]
-        if settings.get("auto_delete_enabled") and int(settings.get("max_cache_bytes", 0)) > 0:
-            prune = _prune_cache(int(settings.get("max_cache_bytes", 0)), "auto")
-            if prune.get("bytes_freed"):
-                freed = _human_size(int(prune.get("bytes_freed", 0)))
-                self._update(
-                    job_id,
-                    state="done",
-                    message=f"Localization complete (pruned {freed})",
-                    current_item=None,
-                )
-                print(
-                    f"[NL Model Localizer] Job {job_id} complete (pruned {freed})",
-                    flush=True,
-                )
-                return
+        if direction == "localize":
+            settings = _usage_snapshot()[1]
+            if settings.get("auto_delete_enabled") and int(settings.get("max_cache_bytes", 0)) > 0:
+                prune = _prune_cache(int(settings.get("max_cache_bytes", 0)), "auto")
+                if prune.get("bytes_freed"):
+                    freed = _human_size(int(prune.get("bytes_freed", 0)))
+                    self._update(
+                        job_id,
+                        state="done",
+                        message=f"Localization complete (pruned {freed})",
+                        current_item=None,
+                    )
+                    print(
+                        f"[NL Model Localizer] Job {job_id} complete (pruned {freed})",
+                        flush=True,
+                    )
+                    return
 
-        self._update(job_id, state="done", message="Localization complete", current_item=None)
-        print(f"[NL Model Localizer] Job {job_id} complete", flush=True)
+            self._update(job_id, state="done", message="Localization complete", current_item=None)
+            print(f"[NL Model Localizer] Job {job_id} complete", flush=True)
+        else:
+            self._update(job_id, state="done", message="Upload complete", current_item=None)
+            print(f"[NL Model Localizer] Job {job_id} complete", flush=True)
 
 
 _job_manager = _JobManager()
@@ -987,6 +1017,34 @@ async def _localize(request):
     return web.json_response({"job_id": job_id})
 
 
+async def _upload(request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    items = payload.get("items", [])
+    overwrite = bool(payload.get("overwrite", False))
+    if not isinstance(items, list) or not items:
+        return web.json_response({"error": "items must be a non-empty list"}, status=400)
+
+    clean_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        category = item.get("category")
+        relpath = _normalize_relpath(item.get("relpath")) if item.get("relpath") else None
+        if not category or not relpath:
+            continue
+        clean_items.append({"category": category, "relpath": relpath})
+
+    if not clean_items:
+        return web.json_response({"error": "no valid items"}, status=400)
+
+    job_id = _job_manager.create_job(clean_items, overwrite, direction="upload")
+    return web.json_response({"job_id": job_id})
+
+
 async def _job_status(request):
     job_id = request.match_info.get("job_id")
     job = _job_manager.get_job(job_id) if job_id else None
@@ -1171,6 +1229,10 @@ def _register_routes():
     async def localize(request):
         return await _localize(request)
 
+    @routes.post("/model_localizer/upload")
+    async def upload(request):
+        return await _upload(request)
+
     @routes.get("/model_localizer/job/{job_id}")
     async def job_status(request):
         return await _job_status(request)
@@ -1225,4 +1287,36 @@ def _register_routes():
     _routes_registered = True
 
 
-_register_routes()
+def _ensure_routes_registered():
+    if _routes_registered:
+        return
+    if PromptServer is None or web is None:
+        return
+    if PromptServer.instance is None:
+        _schedule_route_registration()
+        return
+    _register_routes()
+
+
+def _schedule_route_registration():
+    global _routes_registering
+    if _routes_registering:
+        return
+    _routes_registering = True
+
+    def _wait_for_server():
+        global _routes_registering
+        while True:
+            if PromptServer is None or web is None:
+                break
+            if PromptServer.instance is not None:
+                _register_routes()
+                break
+            time.sleep(0.1)
+        _routes_registering = False
+
+    thread = threading.Thread(target=_wait_for_server, daemon=True)
+    thread.start()
+
+
+_ensure_routes_registered()

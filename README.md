@@ -4,14 +4,23 @@ Custom nodes for ComfyUI maintained by NOLABEL (initially by Wojciech Czub). The
 
 ## Installation
 - Go to your `ComfyUI/custom_nodes` directory and clone or copy this repository into `ComfyUI-NL_Nodes`.
-- Restart ComfyUI. You will find the node under `NOLABEL/Utilities` as "NL Model Manager (Network ↔ Local)".
+- Restart ComfyUI. You will find the "NL Models" button in the top UI to open the Model Manager panel.
 
 ## NL Workflow
-Provides a single source of workflow metadata (show/shot, resolution, timing, project paths) for studio pipelines. The node emits individual outputs plus a combined `workflow_context` dict for downstream nodes. It lives under `NOLABEL/Workflow` as "NL Workflow".
+Provides a single source of workflow metadata (show/shot, resolution, timing, project paths) for studio pipelines. Use the "NL Workflow" button in the top UI to edit defaults and apply cache.
 
 ### Notes
 - Includes a lock toggle and save/load defaults buttons.
 - Defaults are stored in `ComfyUI/user/defaults/nl_workflow.json`.
+- Helper nodes include "NL Resolution", "NL FPS", and "NL Project Path" for pulling values from the cached context.
+- "Reset Defaults" in the top-bar panel clears defaults and in-memory cache for first-run testing.
+- Recent contexts are stored in `ComfyUI/user/defaults/nl_workflow_history.json` (up to 12) when you click "Add" or close the panel.
+
+### Manual test checklist
+- Fresh install: open "NL Workflow" from the top bar and confirm missing fields warning.
+- Enter project/scene/shot/project_path and click "Apply Cache"; confirm status turns green.
+- Save defaults, restart ComfyUI, and confirm defaults reloaded with cache applied automatically.
+- Drop "NL Workflow Resolution" / "NL Workflow FPS" nodes and confirm values match the panel.
 
 ## NL Context Debug
 Utility node for testing. Reads the cached workflow context (by workflow ID or last run) and outputs a JSON string plus the raw context dict.

@@ -44,6 +44,8 @@ function ensureStyles() {
     .nl-ml-muted { color: #9aa0a6; }
     .nl-ml-localize { background: #3a3a3a; border: 1px solid #555; color: #fff; padding: 2px 6px; border-radius: 4px; margin-left: 6px; }
     .nl-ml-localize:disabled { opacity: 0.5; }
+    .nl-ml-upload { background: #2e3a2e; border: 1px solid #4c6b4c; color: #e2ffe2; padding: 2px 6px; border-radius: 4px; margin-left: 6px; }
+    .nl-ml-upload:disabled { opacity: 0.5; }
     .nl-ml-delete { margin-left: 6px; background: transparent; border: 1px solid #444; color: #ff9c9c; padding: 0 4px; border-radius: 4px; cursor: pointer; }
     .nl-ml-delete:disabled { opacity: 0.4; cursor: default; }
     .nl-ml-progress { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
@@ -268,6 +270,12 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
     const localizeSelectedButton = document.createElement("button");
     localizeSelectedButton.textContent = "Localize Selected";
 
+    const uploadAllButton = document.createElement("button");
+    uploadAllButton.textContent = "Upload All";
+
+    const uploadSelectedButton = document.createElement("button");
+    uploadSelectedButton.textContent = "Upload Selected";
+
     const deleteSelectedButton = document.createElement("button");
     deleteSelectedButton.textContent = "Delete Selected";
 
@@ -308,6 +316,8 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
         refreshButton,
         localizeAllButton,
         localizeSelectedButton,
+        uploadAllButton,
+        uploadSelectedButton,
         deleteSelectedButton,
         settingsWrap,
         cacheLabel,
@@ -348,7 +358,7 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
     pageSizeInput.type = "number";
     pageSizeInput.min = "1";
     pageSizeInput.step = "1";
-    pageSizeInput.value = "5";
+    pageSizeInput.value = "10";
     const pageInfo = document.createElement("div");
     pageInfo.className = "nl-ml-page-info";
     const pageStart = document.createElement("span");
@@ -387,7 +397,7 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
     let currentJobId = null;
     let pollTimer = null;
     let currentPage = 1;
-    let pageSize = 5;
+    let pageSize = 10;
     let currentSettings = { auto_delete_enabled: false, max_cache_bytes: 0 };
     let isBusy = false;
     const selectedKeys = new Set();
@@ -426,6 +436,8 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
         refreshButton.disabled = busy;
         localizeAllButton.disabled = busy;
         localizeSelectedButton.disabled = busy;
+        uploadAllButton.disabled = busy;
+        uploadSelectedButton.disabled = busy;
         deleteSelectedButton.disabled = busy;
         workflowButton.disabled = busy;
         localButton.disabled = busy;
@@ -555,6 +567,28 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
             const netDot = document.createElement("span");
             netDot.className = `nl-ml-pill ${item.network_exists ? "ok" : "bad"}`;
             netCell.append(netDot, document.createTextNode(item.network_exists ? "Present" : "Missing"));
+
+            let canUpload = false;
+            let uploadOverwrite = false;
+            if (item.local_exists && item.network_path) {
+                if (!item.network_exists) {
+                    canUpload = true;
+                } else if (item.status === "different_size") {
+                    canUpload = true;
+                    uploadOverwrite = true;
+                }
+            }
+
+            if (canUpload) {
+                const uploadButton = document.createElement("button");
+                uploadButton.className = "nl-ml-upload";
+                uploadButton.textContent = "⬆";
+                uploadButton.title = uploadOverwrite ? "Re-upload" : "Upload";
+                uploadButton.addEventListener("click", () =>
+                    startUpload([{ category: item.category, relpath: item.relpath }], uploadOverwrite)
+                );
+                netCell.appendChild(uploadButton);
+            }
 
             const sizeCell = document.createElement("td");
             if (item.local_exists && item.network_exists) {
@@ -777,6 +811,33 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
         }
     }
 
+    async function startUpload(items, overwrite) {
+        if (isBusy || currentJobId) {
+            setError("Upload already running.");
+            return;
+        }
+        setError("");
+        setBusy(true);
+        progressText.textContent = "Starting upload...";
+        try {
+            const response = await api.fetchApi("/model_localizer/upload", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ items, overwrite }),
+            });
+            const data = await readJsonOrText(response);
+            if (!response.ok) {
+                throw new Error(data?.error || data?._raw || response.statusText);
+            }
+            currentJobId = data.job_id;
+            pollJob();
+        } catch (err) {
+            setBusy(false);
+            setError(err.message || String(err));
+            progressText.textContent = "";
+        }
+    }
+
     async function pollJob() {
         if (!currentJobId) return;
         if (pollTimer) {
@@ -910,8 +971,15 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
         const localizeEligible = selectedItems.filter(
             (item) => item.network_exists && (!item.local_exists || item.status === "different_size")
         );
+        const uploadEligible = selectedItems.filter(
+            (item) =>
+                item.local_exists &&
+                item.network_path &&
+                (!item.network_exists || item.status === "different_size")
+        );
         const deleteEligible = selectedItems.filter((item) => item.local_exists);
         localizeSelectedButton.disabled = isBusy || localizeEligible.length === 0;
+        uploadSelectedButton.disabled = isBusy || uploadEligible.length === 0;
         deleteSelectedButton.disabled = isBusy || deleteEligible.length === 0;
     }
 
@@ -984,6 +1052,23 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
         startLocalize(payloadItems, overwrite);
     });
 
+    uploadAllButton.addEventListener("click", () => {
+        if (isBusy) return;
+        const items = latestData.filter(
+            (item) =>
+                item.local_exists &&
+                item.network_path &&
+                (!item.network_exists || item.status === "different_size")
+        );
+        if (!items.length) {
+            setError("No eligible models to upload");
+            return;
+        }
+        const overwrite = items.some((item) => item.status === "different_size");
+        const payloadItems = items.map((item) => ({ category: item.category, relpath: item.relpath }));
+        startUpload(payloadItems, overwrite);
+    });
+
     localizeSelectedButton.addEventListener("click", () => {
         if (isBusy) return;
         const selectedItems = getSelectedItems();
@@ -997,6 +1082,24 @@ function createModelLocalizerUI({ onResize, autoRefresh = false, initialVisible 
         const overwrite = eligible.some((item) => item.status === "different_size");
         const payloadItems = eligible.map((item) => ({ category: item.category, relpath: item.relpath }));
         startLocalize(payloadItems, overwrite);
+    });
+
+    uploadSelectedButton.addEventListener("click", () => {
+        if (isBusy) return;
+        const selectedItems = getSelectedItems();
+        const eligible = selectedItems.filter(
+            (item) =>
+                item.local_exists &&
+                item.network_path &&
+                (!item.network_exists || item.status === "different_size")
+        );
+        if (!eligible.length) {
+            setError("No selected models eligible to upload");
+            return;
+        }
+        const overwrite = eligible.some((item) => item.status === "different_size");
+        const payloadItems = eligible.map((item) => ({ category: item.category, relpath: item.relpath }));
+        startUpload(payloadItems, overwrite);
     });
 
     deleteSelectedButton.addEventListener("click", () => {

@@ -1,21 +1,23 @@
-from .model_localizer import ModelLocalizer
+from . import model_localizer as _model_localizer  # ensure routes register for top-bar UI
 from .nl_read_write import NLRead, NLWrite
-from .nl_workflow import NLWorkflow, NLContextDebug
+from .nl_workflow import NLContextDebug, NLWorkflowResolution, NLWorkflowFPS, NLWorkflowProjectPath
 
 NODE_CLASS_MAPPINGS = {
-    "ModelLocalizer": ModelLocalizer,
     "NLRead": NLRead,
     "NLWrite": NLWrite,
-    "NLWorkflow": NLWorkflow,
     "NLContextDebug": NLContextDebug,
+    "NLWorkflowResolution": NLWorkflowResolution,
+    "NLWorkflowFPS": NLWorkflowFPS,
+    "NLWorkflowProjectPath": NLWorkflowProjectPath,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "ModelLocalizer": "NL Model Manager (Network ↔ Local)",
     "NLRead": "📥 NL Read",
     "NLWrite": "📤 NL Write",
-    "NLWorkflow": "🎬 NL Workflow",
     "NLContextDebug": "NL Context Debug",
+    "NLWorkflowResolution": "📐 NL Resolution",
+    "NLWorkflowFPS": "🎞️ NL FPS",
+    "NLWorkflowProjectPath": "📁 NL Project Path",
 }
 
 WEB_DIRECTORY = "./js"

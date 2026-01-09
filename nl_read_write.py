@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 
 try:
@@ -87,6 +88,8 @@ _RESIZE_MODES = ["none", "context", "custom"]
 _RESIZE_STRATEGIES = ["stretch", "fit", "fill"]
 
 _ROUTES_REGISTERED = False
+_LAST_WRITE_PAYLOAD: dict | None = None
+_LAST_WRITE_AT = 0.0
 
 
 class NLRead:
@@ -106,9 +109,6 @@ class NLRead:
                 "resize_width": ("INT", {"default": 0, "min": 0, "max": 16384}),
                 "resize_height": ("INT", {"default": 0, "min": 0, "max": 16384}),
             },
-            "optional": {
-                "workflow_context": ("NL_WORKFLOW_CONTEXT",),
-            },
         }
 
     RETURN_TYPES = ("IMAGE", "MASK", "INT", "STRING")
@@ -118,7 +118,7 @@ class NLRead:
 
     @classmethod
     def IS_CHANGED(cls, source="", **_kwargs):
-        context = _get_workflow_context(_kwargs.get("workflow_context"))
+        context = _get_workflow_context()
         resolved = _resolve_source(source, "auto", context)
         signature = _build_change_signature(resolved)
         return signature
@@ -133,7 +133,6 @@ class NLRead:
         resize_mode: str,
         resize_width: int,
         resize_height: int,
-        workflow_context: dict | None = None,
     ):
         if torch is None or np is None or Image is None:
             raise RuntimeError("NL Read requires torch, numpy, and Pillow")
@@ -141,7 +140,7 @@ class NLRead:
         if not source:
             return _empty_output()
 
-        context = _get_workflow_context(workflow_context)
+        context = _get_workflow_context()
         resolved = _resolve_source(source, "auto", context)
         resolved_path = resolved.path
         resolved_mode = resolved.mode
@@ -186,16 +185,127 @@ class NLRead:
 class NLWrite:
     @classmethod
     def INPUT_TYPES(cls):
-        return {"required": {}}
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "mode": (["single", "sequence"],),
+                "name": ("STRING", {"default": "render"}),
+            },
+        }
 
     RETURN_TYPES = ()
     RETURN_NAMES = ()
-    FUNCTION = "noop"
+    FUNCTION = "write"
     CATEGORY = "NOLABEL/IO"
     OUTPUT_NODE = True
 
-    def noop(self):
-        return {}
+    def write(self, images, mode: str, name: str):
+        if torch is None or np is None or Image is None:
+            raise RuntimeError("NL Write requires torch, numpy, and Pillow")
+
+        if images is None:
+            ui_payload = {
+                "nlwrite": {
+                    "preview_url": "",
+                    "preview_kind": "image",
+                    "saved": [],
+                    "summary": "No images input; nothing saved.",
+                    "save_path": "",
+                }
+            }
+            _set_last_write_payload(ui_payload.get("nlwrite"))
+            return {"ui": ui_payload, "result": ()}
+
+        context = _get_workflow_context()
+        base_name = _safe_slug(name) or "render"
+        mode = mode or "single"
+
+        output_root = _output_root_from_context(context)
+        base_prefix = _build_base_folder(context, base_name)
+        version_int = _next_version(output_root, base_prefix)
+        version_tag = f"{base_prefix}_v{version_int:03d}"
+
+        target_dir = output_root
+        format_name = "PNG"
+        if mode == "sequence":
+            target_dir = output_root / version_tag / format_name
+
+        if not _is_safe_path(target_dir, context):
+            raise ValueError("NL Write: output path is outside allowed roots.")
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        preview_path = None
+        saved = []
+        summary = ""
+        image_list = _tensor_to_images(images)
+        if not image_list:
+            ui_payload = {
+                "nlwrite": {
+                    "preview_url": "",
+                    "preview_kind": "image",
+                    "saved": [],
+                    "summary": "No images to save (empty tensor).",
+                    "save_path": "",
+                }
+            }
+            _set_last_write_payload(ui_payload.get("nlwrite"))
+            return {"ui": ui_payload, "result": ()}
+
+        if mode == "sequence":
+            sequence_dir = target_dir
+            for index, image in enumerate(image_list, start=1):
+                filename = f"{version_tag}_{index:04d}.png"
+                dest = sequence_dir / filename
+                image.save(dest, format="PNG")
+                saved.append(str(dest))
+            preview_path = sequence_dir
+            summary = f"Saved {len(saved)} frames to {sequence_dir}"
+        else:
+            filename = f"{version_tag}.png"
+            dest = _dedupe_path(target_dir / filename)
+            image_list[0].save(dest, format="PNG")
+            saved.append(str(dest))
+            preview_path = dest
+            summary = f"Saved 1 image to {dest}"
+
+        preview_url, preview_kind = _build_write_preview(preview_path, mode)
+        ui_payload = {
+            "nlwrite": {
+                "preview_url": preview_url,
+                "preview_kind": preview_kind,
+                "saved": saved,
+                "summary": summary,
+                "save_path": str(preview_path) if preview_path else "",
+            }
+        }
+
+        if folder_paths is not None:
+            try:
+                output_root = Path(folder_paths.get_output_directory()).resolve()
+            except Exception:
+                output_root = None
+            if output_root is not None:
+                ui_images = []
+                for path_str in saved:
+                    path = Path(path_str).resolve()
+                    try:
+                        relative = path.relative_to(output_root)
+                    except Exception:
+                        continue
+                    subfolder = str(relative.parent) if relative.parent.as_posix() != "." else ""
+                    ui_images.append(
+                        {
+                            "filename": relative.name,
+                            "subfolder": subfolder,
+                            "type": "output",
+                        }
+                    )
+                if ui_images:
+                    ui_payload["images"] = ui_images
+
+        _set_last_write_payload(ui_payload.get("nlwrite"))
+        return {"ui": ui_payload, "result": ()}
 
 
 class _ResolvedSource:
@@ -211,6 +321,16 @@ def _empty_output(resolved_path: str = ""):
     image = torch.zeros((1, 1, 1, 3), dtype=torch.float32)
     mask = torch.zeros((1, 1, 1), dtype=torch.float32)
     return image, mask, 0, resolved_path
+
+
+def _set_last_write_payload(payload: dict | None) -> None:
+    global _LAST_WRITE_PAYLOAD, _LAST_WRITE_AT
+    if not isinstance(payload, dict):
+        _LAST_WRITE_PAYLOAD = None
+        _LAST_WRITE_AT = 0.0
+        return
+    _LAST_WRITE_PAYLOAD = dict(payload)
+    _LAST_WRITE_AT = time.time()
 
 
 def _resolve_source(source: str, mode: str, context: dict | None = None) -> _ResolvedSource:
@@ -624,9 +744,7 @@ def _build_change_signature(resolved: _ResolvedSource) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _get_workflow_context(workflow_context: dict | None) -> dict | None:
-    if workflow_context:
-        return workflow_context
+def _get_workflow_context() -> dict | None:
     if get_workflow_context is None:
         return None
     return get_workflow_context()
@@ -698,6 +816,88 @@ def _dedupe_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
         index += 1
+
+
+def _safe_slug(value: str | None) -> str:
+    if not value:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9_-]+", "_", str(value).strip())
+    cleaned = cleaned.strip("_")
+    return cleaned
+
+
+def _output_root_from_context(context: dict | None) -> Path:
+    project_path = _project_path_from_context(context)
+    if project_path:
+        if project_path.name.lower() != "output":
+            project_path = project_path / "output"
+        return project_path
+    if folder_paths is not None:
+        try:
+            return Path(folder_paths.get_output_directory())
+        except Exception:
+            pass
+    return Path.cwd() / "output"
+
+
+def _build_base_folder(context: dict | None, name: str) -> str:
+    shot = ""
+    if isinstance(context, dict):
+        shot = _safe_slug(context.get("shot"))
+    base_name = _safe_slug(name) or "render"
+    if shot:
+        return f"{shot}_{base_name}" if base_name else shot
+    return base_name
+
+
+def _next_version(output_root: Path, base_prefix: str) -> int:
+    version_re = re.compile(rf"^{re.escape(base_prefix)}_v(\\d{{3,}})", re.IGNORECASE)
+    max_version = 0
+    if output_root.exists():
+        for entry in output_root.iterdir():
+            match = version_re.match(entry.name)
+            if not match:
+                continue
+            try:
+                value = int(match.group(1))
+            except ValueError:
+                continue
+            max_version = max(max_version, value)
+    return max_version + 1
+
+
+def _tensor_to_images(images) -> list[Image.Image]:
+    if images is None:
+        return []
+    if not isinstance(images, torch.Tensor):
+        return []
+    if images.dim() == 3:
+        images = images.unsqueeze(0)
+    images = images.detach().cpu().numpy()
+    images = np.clip(images * 255.0, 0, 255).astype(np.uint8)
+    output = []
+    for image in images:
+        if image.ndim == 2:
+            output.append(Image.fromarray(image, mode="L"))
+            continue
+        if image.shape[-1] == 1:
+            output.append(Image.fromarray(image[..., 0], mode="L"))
+            continue
+        if image.shape[-1] == 4:
+            output.append(Image.fromarray(image, mode="RGBA"))
+            continue
+        output.append(Image.fromarray(image[..., :3], mode="RGB"))
+    return output
+
+
+def _build_write_preview(path: Path | None, mode: str) -> tuple[str, str]:
+    if path is None:
+        return "", "image"
+    if mode == "sequence":
+        if _ffmpeg_available():
+            return f"/nl/viewmedia?source={_quote(str(path))}&mode=sequence&anim=1", "video"
+        return f"/nl/viewmedia?source={_quote(str(path))}&mode=sequence", "image"
+    return f"/nl/viewmedia?source={_quote(str(path))}&mode=image", "image"
 
 
 def _video_stats(path: Path) -> dict:
@@ -1216,7 +1416,7 @@ def _register_routes():
         resize_mode = request.rel_url.query.get("resize_mode", "stretch")
         resize_width = _safe_int(request.rel_url.query.get("resize_w"), 0)
         resize_height = _safe_int(request.rel_url.query.get("resize_h"), 0)
-        context = _get_workflow_context(None)
+        context = _get_workflow_context()
         payload = _resolve_preview_info(
             source,
             mode,
@@ -1240,7 +1440,7 @@ def _register_routes():
         if folder_paths is None:
             return web.json_response({"items": []})
 
-        context = _get_workflow_context(None)
+        context = _get_workflow_context()
         project_root = _project_path_from_context(context)
         use_project_root = project_root and root_key in {"input", "output", "temp"}
         if use_project_root:
@@ -1269,6 +1469,13 @@ def _register_routes():
             }
         )
 
+    @routes.get("/nl_write/last")
+    async def nl_write_last(request):
+        payload = _LAST_WRITE_PAYLOAD if isinstance(_LAST_WRITE_PAYLOAD, dict) else None
+        return web.json_response(
+            {"ok": bool(payload), "payload": payload or {}, "at": _LAST_WRITE_AT}
+        )
+
     @routes.get("/nl/viewmedia")
     async def nl_view_media(request):
         source = request.rel_url.query.get("source", "")
@@ -1282,7 +1489,7 @@ def _register_routes():
         resize_mode = request.rel_url.query.get("resize_mode", "stretch")
         resize_width = _safe_int(request.rel_url.query.get("resize_w"), 0)
         resize_height = _safe_int(request.rel_url.query.get("resize_h"), 0)
-        context = _get_workflow_context(None)
+        context = _get_workflow_context()
         resolved = _resolve_source(source, mode, context)
         if not resolved.path:
             raise web.HTTPNotFound()
@@ -1457,7 +1664,7 @@ def _register_routes():
 
     @routes.post("/nl_read/upload")
     async def nl_read_upload(request):
-        context = _get_workflow_context(None)
+        context = _get_workflow_context()
         target = request.rel_url.query.get("target", "project_input")
         if target == "project_input":
             target_dir = _project_input_from_context(context)
