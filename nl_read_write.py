@@ -742,7 +742,11 @@ def _video_stats(path: Path) -> dict:
         duration = None
     if frame_count is not None:
         try:
-            frame_count = int(frame_count)
+            frame_value = float(frame_count)
+            if not math.isfinite(frame_value) or frame_value <= 0:
+                frame_count = None
+            else:
+                frame_count = int(frame_value)
         except (TypeError, ValueError):
             frame_count = None
     if frame_count is None and fps is not None and duration is not None:

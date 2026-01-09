@@ -54,14 +54,11 @@ class NLWorkflow:
                 "width": ("INT", {"default": 1920, "min": 1, "max": 16384}),
                 "height": ("INT", {"default": 1080, "min": 1, "max": 16384}),
                 "fps": ("FLOAT", {"default": 24.0, "min": 0.1, "max": 240.0}),
-                "frame_start": ("INT", {"default": 1001}),
-                "frame_end": ("INT", {"default": 1100}),
                 "project_path": ("STRING", {"default": ""}),
             },
             "optional": {
                 "note": ("STRING", {"default": "", "multiline": True}),
                 "lock": ("BOOLEAN", {"default": False}),
-                "use_env_defaults": ("BOOLEAN", {"default": True}),
             },
         }
 
@@ -69,7 +66,6 @@ class NLWorkflow:
         "INT",
         "INT",
         "FLOAT",
-        "INT",
         "STRING",
         "NL_WORKFLOW_CONTEXT",
     )
@@ -77,7 +73,6 @@ class NLWorkflow:
         "width",
         "height",
         "fps",
-        "frame_count",
         "project_path",
         "workflow_context",
     )
@@ -94,15 +89,12 @@ class NLWorkflow:
         width: int,
         height: int,
         fps: float,
-        frame_start: int,
-        frame_end: int,
         project_path: str,
         note: str = "",
         lock: bool = False,  # noqa: ARG002 - UI-only guard
-        use_env_defaults: bool = True,
     ):
         warnings = []
-        env_defaults = _env_defaults() if use_env_defaults else _EnvDefaults()
+        env_defaults = _env_defaults()
 
         project = _coalesce_text(project, env_defaults.project)
         episode = _coalesce_text(episode, env_defaults.episode)
@@ -131,17 +123,11 @@ class NLWorkflow:
         width = int(width)
         height = int(height)
         fps = float(fps)
-        frame_start = int(frame_start)
-        frame_end = int(frame_end)
 
         if width <= 0 or height <= 0:
             warnings.append("Resolution must be positive.")
         if fps <= 0:
             warnings.append("FPS should be positive.")
-        if frame_end < frame_start:
-            warnings.append("Frame range end is before start.")
-
-        frame_count = max(0, frame_end - frame_start + 1)
 
         context = {
             "workflow_id": str(uuid.uuid4()),
@@ -153,8 +139,6 @@ class NLWorkflow:
             "shot": shot or None,
             "resolution": (width, height),
             "fps": fps,
-            "frame_range": (frame_start, frame_end),
-            "frame_count": frame_count,
             "project_path": project_path or None,
             "note": note or None,
             "warnings": warnings,
@@ -167,7 +151,6 @@ class NLWorkflow:
             width,
             height,
             fps,
-            frame_count,
             project_path or "",
             context,
         )
@@ -339,17 +322,10 @@ def _build_cache_context(payload: dict) -> dict:
     width = _safe_int(payload.get("width"), 0)
     height = _safe_int(payload.get("height"), 0)
     fps = _safe_float(payload.get("fps"), 0.0)
-    frame_start = _safe_int(payload.get("frame_start"), 0)
-    frame_end = _safe_int(payload.get("frame_end"), 0)
-
     if width <= 0 or height <= 0:
         warnings.append("Resolution must be positive.")
     if fps <= 0:
         warnings.append("FPS should be positive.")
-    if frame_end and frame_end < frame_start:
-        warnings.append("Frame range end is before start.")
-
-    frame_count = max(0, frame_end - frame_start + 1) if frame_end and frame_start else None
 
     return {
         "workflow_id": str(uuid.uuid4()),
@@ -361,8 +337,6 @@ def _build_cache_context(payload: dict) -> dict:
         "shot": shot or None,
         "resolution": (width, height),
         "fps": fps,
-        "frame_range": (frame_start, frame_end),
-        "frame_count": frame_count,
         "project_path": project_path or None,
         "note": payload.get("note"),
         "warnings": warnings,
@@ -447,5 +421,5 @@ _register_routes()
 
 # Manual test checklist:
 # - Set identifiers/timing/output, run the node, and confirm outputs match inputs.
-# - Toggle "use_env_defaults" with SHOW/SHOT env vars set and confirm auto-fill.
+# - Set SHOW/SHOT env vars and confirm auto-fill.
 # - Use Save/Load Defaults buttons and confirm `ComfyUI/user/defaults/nl_workflow.json` updates.

@@ -11,11 +11,8 @@ const DEFAULT_FIELDS = new Set([
     "width",
     "height",
     "fps",
-    "frame_start",
-    "frame_end",
     "project_path",
     "note",
-    "use_env_defaults",
     "lock",
 ]);
 
@@ -104,6 +101,7 @@ async function loadDefaults(node) {
     }
     const payload = await response.json();
     applyDefaults(node, payload?.data || {});
+    await populateCache(node);
 }
 
 function applyLockState(node, locked) {
