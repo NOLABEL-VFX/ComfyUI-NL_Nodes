@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -82,7 +83,8 @@ _BROWSER_VIDEO_EXTS = {
     ".m4v",
 }
 
-_FORCE_SIZE_OPTIONS = ["Disabled", "512x?", "1024x?", "?x512"]
+_RESIZE_MODES = ["none", "context", "custom"]
+_RESIZE_STRATEGIES = ["stretch", "fit", "fill"]
 
 _ROUTES_REGISTERED = False
 
@@ -99,6 +101,10 @@ class NLRead:
                 "max_frames": ("INT", {"default": 120, "min": 1, "max": 10000}),
                 "skip_first": ("INT", {"default": 0, "min": 0, "max": 100000}),
                 "every_nth": ("INT", {"default": 1, "min": 1, "max": 1000}),
+                "force_resize": (_RESIZE_MODES,),
+                "resize_mode": (_RESIZE_STRATEGIES,),
+                "resize_width": ("INT", {"default": 0, "min": 0, "max": 16384}),
+                "resize_height": ("INT", {"default": 0, "min": 0, "max": 16384}),
             },
             "optional": {
                 "workflow_context": ("NL_WORKFLOW_CONTEXT",),
@@ -123,6 +129,10 @@ class NLRead:
         max_frames: int,
         skip_first: int,
         every_nth: int,
+        force_resize: str,
+        resize_mode: str,
+        resize_width: int,
+        resize_height: int,
         workflow_context: dict | None = None,
     ):
         if torch is None or np is None or Image is None:
@@ -142,11 +152,12 @@ class NLRead:
         skip_first = max(0, int(skip_first))
         every_nth = max(1, int(every_nth))
         max_frames = max(1, int(max_frames))
-        force_size = "Disabled"
+        target_size = _resolve_resize_target(force_resize, resize_width, resize_height, context)
+        resize_mode = resize_mode or "stretch"
 
         if resolved_mode == "image":
             _ensure_safe_path(Path(resolved_path), context)
-            image, mask = _load_image_tensor(Path(resolved_path), force_size)
+            image, mask = _load_image_tensor(Path(resolved_path), target_size, resize_mode)
             return image, mask, 1, resolved_path
 
         if resolved_mode == "sequence":
@@ -154,7 +165,7 @@ class NLRead:
             if not frames:
                 return _empty_output(resolved_path)
             _ensure_safe_path(frames[0], context)
-            images, masks = _load_images_tensor(frames, force_size)
+            images, masks = _load_images_tensor(frames, target_size, resize_mode)
             return images, masks, images.shape[0], resolved.path
 
         if resolved_mode == "video":
@@ -164,7 +175,8 @@ class NLRead:
                 skip_first=skip_first,
                 every_nth=every_nth,
                 max_frames=max_frames,
-                force_size=force_size,
+                target_size=target_size,
+                resize_mode=resize_mode,
             )
             return images, masks, images.shape[0], resolved_path
 
@@ -375,18 +387,21 @@ def _first_selected_frame(source: str, skip_first: int, every_nth: int) -> Path 
     return None
 
 
-def _load_image_tensor(path: Path, force_size: str):
+def _load_image_tensor(
+    path: Path, target_size: tuple[int, int] | None, resize_mode: str
+):
     image = _open_image(path)
     if image is None:
         return _empty_output(str(path))[:2]
-    target = _resolve_target_size(force_size, image.size)
-    if target:
-        image = image.resize(target, Image.LANCZOS)
+    if target_size:
+        image = _resize_image(image, target_size, resize_mode)
     rgb, alpha = _image_to_arrays(image)
     return _arrays_to_tensor([rgb], [alpha])
 
 
-def _load_images_tensor(paths: list[Path], force_size: str):
+def _load_images_tensor(
+    paths: list[Path], target_size: tuple[int, int] | None, resize_mode: str
+):
     images = []
     masks = []
     target = None
@@ -395,14 +410,9 @@ def _load_images_tensor(paths: list[Path], force_size: str):
         if image is None:
             continue
         if idx == 0:
-            target = _resolve_target_size(force_size, image.size)
-            if target:
-                image = image.resize(target, Image.LANCZOS)
-            else:
-                target = image.size
-        else:
-            if target and image.size != target:
-                image = image.resize(target, Image.LANCZOS)
+            target = target_size or image.size
+        if target and image.size != target:
+            image = _resize_image(image, target, resize_mode)
         rgb, alpha = _image_to_arrays(image)
         images.append(rgb)
         masks.append(alpha)
@@ -455,23 +465,78 @@ def _arrays_to_tensor(images: list[np.ndarray], masks: list[np.ndarray | None]):
     return image_tensor, mask_tensor
 
 
-def _resolve_target_size(force_size: str, size: tuple[int, int]) -> tuple[int, int] | None:
-    if force_size == "Disabled":
+def _resolve_resize_target(
+    mode: str, custom_width: int, custom_height: int, context: dict | None
+) -> tuple[int, int] | None:
+    if not mode or mode == "none":
         return None
-    width, height = size
-    if force_size == "512x?":
-        new_width = 512
-        new_height = max(1, round(height * new_width / width))
-        return (new_width, new_height)
-    if force_size == "1024x?":
-        new_width = 1024
-        new_height = max(1, round(height * new_width / width))
-        return (new_width, new_height)
-    if force_size == "?x512":
-        new_height = 512
-        new_width = max(1, round(width * new_height / height))
-        return (new_width, new_height)
+    if mode == "context" and context and isinstance(context, dict):
+        resolution = context.get("resolution")
+        if isinstance(resolution, (list, tuple)) and len(resolution) == 2:
+            width, height = resolution
+            try:
+                width = int(width)
+                height = int(height)
+            except (TypeError, ValueError):
+                return None
+            if width > 0 and height > 0:
+                return (width, height)
+        return None
+    if mode == "custom":
+        try:
+            width = int(custom_width)
+            height = int(custom_height)
+        except (TypeError, ValueError):
+            return None
+        if width > 0 and height > 0:
+            return (width, height)
     return None
+
+
+def _resize_image(image: Image.Image, target_size: tuple[int, int], resize_mode: str) -> Image.Image:
+    mode = resize_mode or "stretch"
+    target_w, target_h = target_size
+    if mode == "stretch":
+        return image.resize((target_w, target_h), Image.LANCZOS)
+    src_w, src_h = image.size
+    if src_w == 0 or src_h == 0:
+        return image.resize((target_w, target_h), Image.LANCZOS)
+    if mode == "fit":
+        scale = min(target_w / src_w, target_h / src_h)
+        new_w = max(1, int(round(src_w * scale)))
+        new_h = max(1, int(round(src_h * scale)))
+        resized = image.resize((new_w, new_h), Image.LANCZOS)
+        has_alpha = image.mode in ("RGBA", "LA") or "transparency" in image.info
+        canvas_mode = "RGBA" if has_alpha else "RGB"
+        fill = (0, 0, 0, 0) if has_alpha else (0, 0, 0)
+        if resized.mode != canvas_mode:
+            resized = resized.convert(canvas_mode)
+        canvas = Image.new(canvas_mode, (target_w, target_h), fill)
+        offset = ((target_w - new_w) // 2, (target_h - new_h) // 2)
+        canvas.paste(resized, offset)
+        return canvas
+    if mode == "fill":
+        scale = max(target_w / src_w, target_h / src_h)
+        new_w = max(1, int(round(src_w * scale)))
+        new_h = max(1, int(round(src_h * scale)))
+        resized = image.resize((new_w, new_h), Image.LANCZOS)
+        left = max(0, (new_w - target_w) // 2)
+        top = max(0, (new_h - target_h) // 2)
+        return resized.crop((left, top, left + target_w, top + target_h))
+    return image.resize((target_w, target_h), Image.LANCZOS)
+
+
+def _ffmpeg_resize_filter(target_size: tuple[int, int], resize_mode: str) -> str:
+    target_w, target_h = target_size
+    mode = resize_mode or "stretch"
+    if mode == "fit":
+        return (
+            f"scale={target_w}:{target_h}:force_original_aspect_ratio=decrease,"
+            f"pad={target_w}:{target_h}:(ow-iw)/2:(oh-ih)/2"
+        )
+    if mode == "fill":
+        return f"scale={target_w}:{target_h}:force_original_aspect_ratio=increase,crop={target_w}:{target_h}"
+    return f"scale={target_w}:{target_h}"
 
 
 def _load_video_tensor(
@@ -479,7 +544,8 @@ def _load_video_tensor(
     skip_first: int,
     every_nth: int,
     max_frames: int,
-    force_size: str,
+    target_size: tuple[int, int] | None,
+    resize_mode: str,
 ):
     if iio is None:
         raise RuntimeError("imageio is required to read video files")
@@ -495,14 +561,9 @@ def _load_video_tensor(
             continue
         pil_frame = Image.fromarray(frame)
         if target is None:
-            target = _resolve_target_size(force_size, pil_frame.size)
-            if target:
-                pil_frame = pil_frame.resize(target, Image.LANCZOS)
-            else:
-                target = pil_frame.size
-        else:
-            if target and pil_frame.size != target:
-                pil_frame = pil_frame.resize(target, Image.LANCZOS)
+            target = target_size or pil_frame.size
+        if target and pil_frame.size != target:
+            pil_frame = _resize_image(pil_frame, target, resize_mode)
         rgb, alpha = _image_to_arrays(pil_frame)
         images.append(rgb)
         masks.append(alpha)
@@ -786,16 +847,22 @@ def _resolve_preview_info(
     skip_first: int = 0,
     every_nth: int = 1,
     max_frames: int = 0,
+    force_resize: str = "none",
+    resize_mode: str = "stretch",
+    resize_width: int = 0,
+    resize_height: int = 0,
 ):
     resolved = _resolve_source(source, mode, context)
     project_input = _project_input_from_context(context)
     has_context = project_input is not None
+    resize_to = _resolve_resize_target(force_resize, resize_width, resize_height, context)
+    resize_mode = resize_mode or "stretch"
     if not resolved.path:
         return {
             "url": "",
             "kind": "",
             "mode": resolved.mode,
-            "stats": {},
+            "stats": {"resize_to": resize_to, "resize_mode": resize_mode},
             "resolved_path": "",
             "has_context": has_context,
             "project_input": str(project_input) if project_input else "",
@@ -809,7 +876,7 @@ def _resolve_preview_info(
                 "url": "",
                 "kind": "",
                 "mode": resolved.mode,
-                "stats": {},
+                "stats": {"resize_to": resize_to, "resize_mode": resize_mode},
                 "resolved_path": resolved.path,
                 "has_context": has_context,
                 "project_input": str(project_input) if project_input else "",
@@ -820,19 +887,30 @@ def _resolve_preview_info(
                 "url": "",
                 "kind": "",
                 "mode": resolved.mode,
-                "stats": {},
+                "stats": {"resize_to": resize_to, "resize_mode": resize_mode},
                 "resolved_path": resolved.path,
                 "has_context": has_context,
                 "project_input": str(project_input) if project_input else "",
                 "blocked_reason": _blocked_message(has_context),
             }
         selected_count = _selected_frame_count(frame_count, skip_first, every_nth, max_frames)
-        stats = {"frame_count": frame_count, "selected_frames": selected_count}
+        stats = {
+            "frame_count": frame_count,
+            "selected_frames": selected_count,
+            "resize_to": resize_to,
+            "resize_mode": resize_mode,
+        }
         preview_params = (
             f"&skip_first={max(0, int(skip_first))}"
             f"&every_nth={max(1, int(every_nth))}"
             f"&max_frames={max(0, int(max_frames))}"
         )
+        if resize_to:
+            preview_params += (
+                f"&force_resize={_quote(str(force_resize))}"
+                f"&resize_mode={_quote(str(resize_mode))}"
+                f"&resize_w={resize_to[0]}&resize_h={resize_to[1]}"
+            )
         if _ffmpeg_available():
             return {
                 "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode=sequence&anim=1{preview_params}",
@@ -856,7 +934,7 @@ def _resolve_preview_info(
                 "blocked_reason": _blocked_message(has_context),
             }
         return {
-            "url": f"/nl/viewmedia?source={_quote(str(first_selected))}&mode=image",
+            "url": f"/nl/viewmedia?source={_quote(str(first_selected))}&mode=image{preview_params}",
             "kind": "image",
             "mode": resolved.mode,
             "stats": stats,
@@ -870,7 +948,7 @@ def _resolve_preview_info(
             "url": "",
             "kind": "",
             "mode": resolved.mode,
-            "stats": {},
+            "stats": {"resize_to": resize_to, "resize_mode": resize_mode},
             "resolved_path": resolved.path,
             "has_context": has_context,
             "project_input": str(project_input) if project_input else "",
@@ -882,12 +960,21 @@ def _resolve_preview_info(
         selected_count = _selected_frame_count(stats.get("frame_count"), skip_first, every_nth, max_frames)
         if selected_count is not None:
             stats["selected_frames"] = selected_count
+        if resize_to:
+            stats["resize_to"] = resize_to
+        stats["resize_mode"] = resize_mode
         preview_params = (
             f"&skip_first={max(0, int(skip_first))}"
             f"&every_nth={max(1, int(every_nth))}"
             f"&max_frames={max(0, int(max_frames))}"
         )
-        force_transcode = skip_first > 0 or every_nth > 1 or max_frames > 0
+        if resize_to:
+            preview_params += (
+                f"&force_resize={_quote(str(force_resize))}"
+                f"&resize_mode={_quote(str(resize_mode))}"
+                f"&resize_w={resize_to[0]}&resize_h={resize_to[1]}"
+            )
+        force_transcode = skip_first > 0 or every_nth > 1 or max_frames > 0 or resize_to is not None
         if (path.suffix.lower() not in _BROWSER_VIDEO_EXTS or force_transcode) and _ffmpeg_available():
             return {
                 "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode=video&transcode=1{preview_params}",
@@ -899,23 +986,49 @@ def _resolve_preview_info(
                 "project_input": str(project_input) if project_input else "",
             }
 
-    view_url = _view_url_for_path(path)
-    if view_url:
+    if resolved.mode == "image":
+        preview_params = ""
+        if resize_to:
+            preview_params = (
+                f"&force_resize={_quote(str(force_resize))}"
+                f"&resize_mode={_quote(str(resize_mode))}"
+                f"&resize_w={resize_to[0]}&resize_h={resize_to[1]}"
+            )
+        stats = {"resize_to": resize_to, "resize_mode": resize_mode}
         return {
-            "url": view_url,
-            "kind": resolved.mode,
+            "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode=image{preview_params}",
+            "kind": "image",
             "mode": resolved.mode,
-            "stats": stats if resolved.mode == "video" else {},
+            "stats": stats,
             "resolved_path": resolved.path,
             "has_context": has_context,
             "project_input": str(project_input) if project_input else "",
         }
 
+    view_url = _view_url_for_path(path)
+    if view_url and not resize_to:
+        return {
+            "url": view_url,
+            "kind": resolved.mode,
+            "mode": resolved.mode,
+            "stats": stats if resolved.mode == "video" else {"resize_to": resize_to, "resize_mode": resize_mode},
+            "resolved_path": resolved.path,
+            "has_context": has_context,
+            "project_input": str(project_input) if project_input else "",
+        }
+
+    preview_params = ""
+    if resize_to:
+        preview_params = (
+            f"&force_resize={_quote(str(force_resize))}"
+            f"&resize_mode={_quote(str(resize_mode))}"
+            f"&resize_w={resize_to[0]}&resize_h={resize_to[1]}"
+        )
     return {
-        "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode={resolved.mode}",
+        "url": f"/nl/viewmedia?source={_quote(resolved.path)}&mode={resolved.mode}{preview_params}",
         "kind": resolved.mode,
         "mode": resolved.mode,
-        "stats": stats if resolved.mode == "video" else {},
+        "stats": stats if resolved.mode == "video" else {"resize_to": resize_to, "resize_mode": resize_mode},
         "resolved_path": resolved.path,
         "has_context": has_context,
         "project_input": str(project_input) if project_input else "",
@@ -1095,8 +1208,23 @@ def _register_routes():
         skip_first = _safe_int(request.rel_url.query.get("skip_first"), 0)
         every_nth = _safe_int(request.rel_url.query.get("every_nth"), 1)
         max_frames = _safe_int(request.rel_url.query.get("max_frames"), 0)
+        force_resize = request.rel_url.query.get("force_resize", "none")
+        resize_mode = request.rel_url.query.get("resize_mode", "stretch")
+        resize_width = _safe_int(request.rel_url.query.get("resize_w"), 0)
+        resize_height = _safe_int(request.rel_url.query.get("resize_h"), 0)
         context = _get_workflow_context(None)
-        payload = _resolve_preview_info(source, mode, context, skip_first, every_nth, max_frames)
+        payload = _resolve_preview_info(
+            source,
+            mode,
+            context,
+            skip_first,
+            every_nth,
+            max_frames,
+            force_resize,
+            resize_mode,
+            resize_width,
+            resize_height,
+        )
         return web.json_response(payload)
 
     @routes.get("/nl_read/list")
@@ -1146,10 +1274,16 @@ def _register_routes():
         skip_first = _safe_int(request.rel_url.query.get("skip_first"), 0)
         every_nth = _safe_int(request.rel_url.query.get("every_nth"), 1)
         max_frames = _safe_int(request.rel_url.query.get("max_frames"), 0)
+        force_resize = request.rel_url.query.get("force_resize", "none")
+        resize_mode = request.rel_url.query.get("resize_mode", "stretch")
+        resize_width = _safe_int(request.rel_url.query.get("resize_w"), 0)
+        resize_height = _safe_int(request.rel_url.query.get("resize_h"), 0)
         context = _get_workflow_context(None)
         resolved = _resolve_source(source, mode, context)
         if not resolved.path:
             raise web.HTTPNotFound()
+        resize_to = _resolve_resize_target(force_resize, resize_width, resize_height, context)
+        resize_mode = resize_mode or "stretch"
 
         path = Path(resolved.path)
         if resolved.mode == "sequence":
@@ -1183,6 +1317,9 @@ def _register_routes():
                     handle.write(concat_text)
                     concat_path = Path(handle.name)
 
+                vf_parts = []
+                if resize_to:
+                    vf_parts.append(_ffmpeg_resize_filter(resize_to, resize_mode))
                 cmd = [
                     "ffmpeg",
                     "-hide_banner",
@@ -1194,6 +1331,7 @@ def _register_routes():
                     "0",
                     "-i",
                     str(concat_path),
+                    *(["-vf", ",".join(vf_parts)] if vf_parts else []),
                     "-c:v",
                     "libx264",
                     "-preset",
@@ -1231,6 +1369,14 @@ def _register_routes():
                         pass
                 await response.write_eof()
                 return response
+            if resize_to and Image is not None:
+                image = _open_image(first_frame)
+                if image is None:
+                    raise web.HTTPNotFound()
+                image = _resize_image(image, resize_to, resize_mode)
+                buffer = io.BytesIO()
+                image.save(buffer, format="PNG")
+                return web.Response(body=buffer.getvalue(), content_type="image/png")
             return web.FileResponse(path=first_frame)
 
         if resolved.mode == "video" and transcode and _ffmpeg_available():
@@ -1245,6 +1391,8 @@ def _register_routes():
                 mod_expr = f"not(mod(n-{max(0, int(skip_first))}\\,{step}))"
                 vf_parts.append(f"select='{skip_expr}*{mod_expr}'")
                 vf_parts.append("setpts=N/FRAME_RATE/TB")
+            if resize_to:
+                vf_parts.append(_ffmpeg_resize_filter(resize_to, resize_mode))
             cmd = [
                 "ffmpeg",
                 "-hide_banner",
@@ -1293,6 +1441,14 @@ def _register_routes():
             raise web.HTTPForbidden()
         if not path.exists():
             raise web.HTTPNotFound()
+        if resize_to and Image is not None and resolved.mode == "image":
+            image = _open_image(path)
+            if image is None:
+                raise web.HTTPNotFound()
+            image = _resize_image(image, resize_to, resize_mode)
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG")
+            return web.Response(body=buffer.getvalue(), content_type="image/png")
         return web.FileResponse(path=path)
 
     @routes.post("/nl_read/upload")

@@ -227,12 +227,45 @@ function attachPreview(node) {
 
     let lastResolve = null;
     let sourceWidget = ensureComboWidget(node, findWidget(node, "source"));
+    const resizeModeWidget = findWidget(node, "force_resize");
+    const resizeStrategyWidget = findWidget(node, "resize_mode");
+    const resizeWidthWidget = findWidget(node, "resize_width");
+    const resizeHeightWidget = findWidget(node, "resize_height");
+    const updateResizeFields = () => {
+        const resizeMode = resizeModeWidget?.value || "none";
+        const isCustom = resizeMode === "custom";
+        const showStrategy = resizeMode !== "none";
+        if (resizeWidthWidget) {
+            resizeWidthWidget.hidden = !isCustom;
+            resizeWidthWidget.disabled = !isCustom;
+        }
+        if (resizeHeightWidget) {
+            resizeHeightWidget.hidden = !isCustom;
+            resizeHeightWidget.disabled = !isCustom;
+        }
+        if (resizeStrategyWidget) {
+            resizeStrategyWidget.hidden = !showStrategy;
+            resizeStrategyWidget.disabled = !showStrategy;
+        }
+        node.setDirtyCanvas(true, true);
+    };
+    const updateFrameControls = () => {
+        const isImage = (statsState.mode || statsState.kind) === "image";
+        for (const widgetName of ["max_frames", "skip_first", "every_nth"]) {
+            const widget = findWidget(node, widgetName);
+            if (!widget) continue;
+            widget.hidden = isImage;
+            widget.disabled = isImage;
+        }
+        node.setDirtyCanvas(true, true);
+    };
     const statsState = {
         mode: "",
         kind: "",
         frameCount: null,
         fps: null,
         selectedFrames: null,
+        resizeTo: null,
         width: null,
         height: null,
         duration: null,
@@ -249,7 +282,10 @@ function attachPreview(node) {
         const label =
             mode === "sequence" ? "Sequence" : mode === "video" ? "Video" : mode === "image" ? "Image" : "Media";
         const parts = [label];
-        if (statsState.width && statsState.height) {
+        const resizeTo = statsState.resizeTo;
+        if (resizeTo && Array.isArray(resizeTo) && resizeTo.length === 2) {
+            parts.push(`${resizeTo[0]}x${resizeTo[1]}`);
+        } else if (statsState.width && statsState.height) {
             parts.push(`${statsState.width}x${statsState.height}`);
         }
         if (mode === "sequence" && Number.isFinite(statsState.frameCount)) {
@@ -333,10 +369,18 @@ function attachPreview(node) {
         const skipFirst = Math.max(0, Number(findWidget(node, "skip_first")?.value || 0));
         const everyNth = Math.max(1, Number(findWidget(node, "every_nth")?.value || 1));
         const maxFrames = Math.max(0, Number(findWidget(node, "max_frames")?.value || 0));
+        const resizeMode = resizeModeWidget?.value || "none";
+        const resizeStrategy = resizeStrategyWidget?.value || "stretch";
+        const resizeWidth = Math.max(0, Number(resizeWidthWidget?.value || 0));
+        const resizeHeight = Math.max(0, Number(resizeHeightWidget?.value || 0));
 
         const url = `/nl_read/resolve?source=${encodeURIComponent(source)}&mode=auto&skip_first=${encodeURIComponent(
             skipFirst
-        )}&every_nth=${encodeURIComponent(everyNth)}&max_frames=${encodeURIComponent(maxFrames)}`;
+        )}&every_nth=${encodeURIComponent(everyNth)}&max_frames=${encodeURIComponent(
+            maxFrames
+        )}&force_resize=${encodeURIComponent(resizeMode)}&resize_mode=${encodeURIComponent(
+            resizeStrategy
+        )}&resize_w=${encodeURIComponent(resizeWidth)}&resize_h=${encodeURIComponent(resizeHeight)}`;
         const response = await api.fetchApi(url);
         if (!response.ok) {
             return;
@@ -351,10 +395,13 @@ function attachPreview(node) {
         statsState.frameCount = payload?.stats?.frame_count ?? null;
         statsState.fps = payload?.stats?.fps ?? null;
         statsState.selectedFrames = payload?.stats?.selected_frames ?? null;
+        statsState.resizeTo = payload?.stats?.resize_to || null;
         statsState.width = null;
         statsState.height = null;
         statsState.duration = null;
         statsState.path = payload?.resolved_path || source;
+
+        updateFrameControls();
 
         if (!previewUrl) {
             container.classList.remove("is-image", "is-video");
@@ -365,11 +412,13 @@ function attachPreview(node) {
             statsState.frameCount = null;
             statsState.fps = null;
             statsState.selectedFrames = null;
+            statsState.resizeTo = null;
             statsState.width = null;
             statsState.height = null;
             statsState.duration = null;
             statsState.path = "";
             updateStatsDisplay();
+            updateFrameControls();
             if (blockedReason) {
                 message.textContent = blockedReason;
                 message.style.display = "block";
@@ -408,7 +457,41 @@ function attachPreview(node) {
         };
     }
 
+    if (resizeModeWidget) {
+        const original = resizeModeWidget.callback;
+        resizeModeWidget.callback = function () {
+            if (typeof original === "function") {
+                original.apply(this, arguments);
+            }
+            updateResizeFields();
+            updatePreview();
+        };
+        updateResizeFields();
+    }
+
+    if (resizeStrategyWidget) {
+        const original = resizeStrategyWidget.callback;
+        resizeStrategyWidget.callback = function () {
+            if (typeof original === "function") {
+                original.apply(this, arguments);
+            }
+            updatePreview();
+        };
+    }
+
     for (const widgetName of ["skip_first", "every_nth", "max_frames"]) {
+        const widget = findWidget(node, widgetName);
+        if (!widget) continue;
+        const original = widget.callback;
+        widget.callback = function () {
+            if (typeof original === "function") {
+                original.apply(this, arguments);
+            }
+            updatePreview();
+        };
+    }
+
+    for (const widgetName of ["resize_width", "resize_height"]) {
         const widget = findWidget(node, widgetName);
         if (!widget) continue;
         const original = widget.callback;
