@@ -22,6 +22,9 @@ const DEFAULT_FIELDS = new Set([
     "note",
     "lock",
 ]);
+const WORKFLOW_BINDING_KEY = "__nlWorkflowContext";
+const WORKFLOW_BINDING_VERSION = 1;
+const WORKFLOW_EXTRA_KEY = "nl_workflow_context";
 
 const DEBUG_STYLE_ID = "nl-context-debug-style";
 const PANEL_STYLE_ID = "nl-workflow-panel-style";
@@ -31,6 +34,13 @@ const REQUIRED_FIELDS = ["project", "scene", "shot", "project_path"];
 const REQUIRED_CACHE_FIELDS = ["project_path"];
 const AUTO_APPLY_DELAY_MS = 600;
 const HISTORY_LIMIT = 12;
+let LAST_BINDING_SIGNATURE = "";
+let LAST_BOUND_PAYLOAD = null;
+let PANEL_API = null;
+let PANEL_PENDING_PAYLOAD = null;
+let PANEL_PENDING_STATUS = null;
+let WORKFLOW_SYNCING = false;
+let GRAPH_BIND_TIMER = null;
 
 function ensureDebugStyles() {
     if (document.getElementById(DEBUG_STYLE_ID)) return;
@@ -342,6 +352,102 @@ function extractDebugOutput(message) {
     return null;
 }
 
+function bindingSignature(payload) {
+    const data = {};
+    for (const key of DEFAULT_FIELDS) {
+        data[key] = payload?.[key] ?? "";
+    }
+    return JSON.stringify(data);
+}
+
+function bindingPayload(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    if (raw.data && typeof raw.data === "object") return raw.data;
+    return raw;
+}
+
+function getGraph() {
+    return app?.graph || null;
+}
+
+function getGraphExtra(graph = getGraph()) {
+    if (!graph) return null;
+    graph.extra = graph.extra || {};
+    return graph.extra;
+}
+
+function getNLWorkflowNodes() {
+    const nodes = app?.graph?._nodes || [];
+    return nodes.filter((node) => {
+        const type = node?.type || node?.constructor?.type || "";
+        const title = node?.title || "";
+        return type === NODE_NAME || title === "NL Workflow";
+    });
+}
+
+function persistWorkflowBinding(node, payload) {
+    if (!node || !payload) return;
+    node.properties = node.properties || {};
+    node.properties[WORKFLOW_BINDING_KEY] = {
+        version: WORKFLOW_BINDING_VERSION,
+        data: payload,
+    };
+}
+
+function readWorkflowBinding(node) {
+    return bindingPayload(node?.properties?.[WORKFLOW_BINDING_KEY]);
+}
+
+function persistWorkflowExtra(payload) {
+    if (!payload) return;
+    const extra = getGraphExtra();
+    if (!extra) return;
+    extra[WORKFLOW_EXTRA_KEY] = {
+        version: WORKFLOW_BINDING_VERSION,
+        data: payload,
+    };
+}
+
+function readWorkflowExtra(data) {
+    return bindingPayload(data?.extra?.[WORKFLOW_EXTRA_KEY]);
+}
+
+function updatePanelPayload(payload) {
+    if (!payload) return;
+    if (PANEL_API?.setPayload) {
+        PANEL_API.setPayload(payload);
+        return;
+    }
+    PANEL_PENDING_PAYLOAD = payload;
+}
+
+function updatePanelStatus(ok, error) {
+    if (PANEL_API?.setApplyState) {
+        PANEL_API.setApplyState(ok, error);
+        return;
+    }
+    PANEL_PENDING_STATUS = { ok, error };
+}
+
+async function applyWorkflowBinding(payload, { notifyOnError = false } = {}) {
+    if (!payload) return { ok: false, error: "no-payload" };
+    const signature = bindingSignature(payload);
+    if (signature && signature === LAST_BINDING_SIGNATURE) {
+        return { ok: true, skipped: true };
+    }
+    LAST_BINDING_SIGNATURE = signature;
+    LAST_BOUND_PAYLOAD = payload;
+    persistWorkflowExtra(payload);
+    const ok = await saveDefaultsPayload(payload);
+    if (!ok) {
+        console.warn("[NL Workflow] Failed to persist defaults for workflow binding");
+    }
+    const result = await populateCachePayload(payload, { notifyOnError });
+    updatePanelPayload(payload);
+    updatePanelStatus(result.ok, result.ok ? null : result.error);
+    return result;
+}
+
 async function saveDefaultsPayload(payload) {
     const response = await api.fetchApi("/nl_workflow/defaults", {
         method: "POST",
@@ -465,6 +571,11 @@ async function saveDefaults(node) {
     if (!ok) {
         console.warn("[NL Workflow] Failed to save defaults");
     }
+    if (!missingRequiredFields(payload).length) {
+        persistWorkflowBinding(node, payload);
+        persistWorkflowExtra(payload);
+        LAST_BOUND_PAYLOAD = payload;
+    }
 }
 
 async function loadDefaults(node) {
@@ -474,7 +585,15 @@ async function loadDefaults(node) {
         return;
     }
     applyDefaults(node, result.data || {});
-    await populateCache(node);
+    const cacheResult = await populateCache(node);
+    if (!missingRequiredFields(result.data).length) {
+        persistWorkflowBinding(node, result.data || {});
+        persistWorkflowExtra(result.data || {});
+        LAST_BOUND_PAYLOAD = result.data || null;
+    }
+    if (cacheResult?.ok) {
+        updatePanelStatus(true, null);
+    }
 }
 
 function applyLockState(node, locked) {
@@ -498,6 +617,27 @@ function attachLockHandler(node) {
         applyLockState(node, Boolean(value));
     };
     applyLockState(node, Boolean(lockWidget.value));
+}
+
+function attachBindingHandlers(node) {
+    for (const widget of node.widgets || []) {
+        if (!widget || !widget.name || !DEFAULT_FIELDS.has(widget.name)) continue;
+        if (widget.type === "button") continue;
+        if (widget.__nlBindingAttached) continue;
+        widget.__nlBindingAttached = true;
+        const original = widget.callback;
+        widget.callback = function () {
+            if (typeof original === "function") {
+                original.apply(this, arguments);
+            }
+            if (!WORKFLOW_SYNCING) {
+                const payload = collectDefaults(node);
+                if (!missingRequiredFields(payload).length) {
+                    persistWorkflowBinding(node, payload);
+                }
+            }
+        };
+    }
 }
 
 function insertWidgetAfter(node, targetName, widget) {
@@ -561,7 +701,74 @@ async function populateCachePayload(payload, { notifyOnError = true } = {}) {
 
 async function populateCache(node) {
     const payload = collectDefaults(node);
-    return populateCachePayload(payload);
+    const result = await populateCachePayload(payload);
+    if (!missingRequiredFields(payload).length) {
+        persistWorkflowBinding(node, payload);
+        persistWorkflowExtra(payload);
+        LAST_BOUND_PAYLOAD = payload;
+    }
+    return result;
+}
+
+function syncWorkflowNodesFromPayload(payload) {
+    if (WORKFLOW_SYNCING) return;
+    if (!payload || missingRequiredFields(payload).length) return;
+    WORKFLOW_SYNCING = true;
+    try {
+        for (const node of getNLWorkflowNodes()) {
+            applyDefaults(node, payload);
+            persistWorkflowBinding(node, payload);
+        }
+    } finally {
+        WORKFLOW_SYNCING = false;
+    }
+}
+
+function attachGraphBinding() {
+    const graph = getGraph();
+    if (!graph) {
+        if (!GRAPH_BIND_TIMER) {
+            GRAPH_BIND_TIMER = setTimeout(() => {
+                GRAPH_BIND_TIMER = null;
+                attachGraphBinding();
+            }, 200);
+        }
+        return;
+    }
+    if (graph.__nlWorkflowBound) return;
+    graph.__nlWorkflowBound = true;
+
+    const originalConfigure = graph.configure;
+    graph.configure = function () {
+        const result = originalConfigure?.apply(this, arguments);
+        const payload = readWorkflowExtra(arguments?.[0]);
+        if (payload && !missingRequiredFields(payload).length) {
+            void applyWorkflowBinding(payload, { notifyOnError: false });
+            syncWorkflowNodesFromPayload(payload);
+        }
+        return result;
+    };
+
+    const originalSerialize = graph.serialize;
+    graph.serialize = function () {
+        const data = originalSerialize?.apply(this, arguments);
+        if (!data || typeof data !== "object") return data;
+        const payload = LAST_BOUND_PAYLOAD;
+        if (payload && !missingRequiredFields(payload).length) {
+            data.extra = data.extra || {};
+            data.extra[WORKFLOW_EXTRA_KEY] = {
+                version: WORKFLOW_BINDING_VERSION,
+                data: payload,
+            };
+        }
+        return data;
+    };
+
+    const initialPayload = readWorkflowExtra({ extra: graph.extra });
+    if (initialPayload && !missingRequiredFields(initialPayload).length) {
+        void applyWorkflowBinding(initialPayload, { notifyOnError: false });
+        syncWorkflowNodesFromPayload(initialPayload);
+    }
 }
 
 function createField({ name, label, type = "text", placeholder = "", min, max, step }) {
@@ -819,6 +1026,11 @@ function createWorkflowPanel() {
         updateStatus();
         if (result.ok) {
             await refreshHistory();
+            syncWorkflowNodesFromPayload(payload);
+            if (!missingRequiredFields(payload).length) {
+                persistWorkflowExtra(payload);
+                LAST_BOUND_PAYLOAD = payload;
+            }
         }
         return result;
     }
@@ -1113,6 +1325,27 @@ function createWorkflowPanel() {
         }
     }
 
+    PANEL_API = {
+        setPayload: (payload) => {
+            applyDefaultsToInputs(inputs, payload);
+            applyLockState(isLocked());
+            updateStatus();
+        },
+        setApplyState: (ok, error) => {
+            lastApplyOk = ok;
+            lastError = error;
+            updateStatus();
+        },
+    };
+    if (PANEL_PENDING_PAYLOAD) {
+        PANEL_API.setPayload(PANEL_PENDING_PAYLOAD);
+        PANEL_PENDING_PAYLOAD = null;
+    }
+    if (PANEL_PENDING_STATUS) {
+        PANEL_API.setApplyState(PANEL_PENDING_STATUS.ok, PANEL_PENDING_STATUS.error);
+        PANEL_PENDING_STATUS = null;
+    }
+
     initializeDefaults();
 }
 
@@ -1120,6 +1353,7 @@ app.registerExtension({
     name: EXTENSION_NAME,
     async beforeRegisterNodeDef(nodeType, nodeData) {
         const onNodeCreated = nodeType.prototype.onNodeCreated;
+        const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onNodeCreated = function () {
             const result = onNodeCreated?.apply(this, arguments);
             if (BLACK_NODE_NAMES.has(nodeData?.name)) {
@@ -1178,10 +1412,31 @@ app.registerExtension({
                 const cacheWidget = this.addWidget("button", "Apply Cache", "", () => populateCache(this));
                 insertWidgetAfter(this, "project_path", cacheWidget);
                 attachLockHandler(this);
-                setTimeout(() => populateCache(this), 0);
+                attachBindingHandlers(this);
+                const storedBinding = readWorkflowBinding(this);
+                if (!storedBinding) {
+                    setTimeout(() => populateCache(this), 0);
+                }
             }
             return result;
         };
+        if (nodeData?.name === NODE_NAME) {
+            nodeType.prototype.onConfigure = function () {
+                const result = onConfigure?.apply(this, arguments);
+                const storedBinding = readWorkflowBinding(this);
+                if (storedBinding) {
+                    WORKFLOW_SYNCING = true;
+                    try {
+                        applyDefaults(this, storedBinding);
+                        persistWorkflowBinding(this, storedBinding);
+                    } finally {
+                        WORKFLOW_SYNCING = false;
+                    }
+                    void applyWorkflowBinding(storedBinding, { notifyOnError: false });
+                }
+                return result;
+            };
+        }
     },
     setup() {
         const init = () => {
@@ -1190,6 +1445,7 @@ app.registerExtension({
                 return;
             }
             createWorkflowPanel();
+            attachGraphBinding();
         };
         init();
     },
@@ -1200,6 +1456,7 @@ app.registerExtension({
                 return;
             }
             createWorkflowPanel();
+            attachGraphBinding();
         };
         init();
     },

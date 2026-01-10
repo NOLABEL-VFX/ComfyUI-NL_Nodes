@@ -14,8 +14,10 @@ from pathlib import Path
 
 try:
     from aiohttp import web
+    from aiohttp.client_exceptions import ClientConnectionResetError
 except Exception:  # pragma: no cover
     web = None
+    ClientConnectionResetError = ConnectionResetError
 
 try:
     from server import PromptServer
@@ -86,6 +88,19 @@ _BROWSER_VIDEO_EXTS = {
 
 _RESIZE_MODES = ["none", "context", "custom"]
 _RESIZE_STRATEGIES = ["stretch", "fit", "fill"]
+_SINGLE_EXTENSIONS = ["png", "jpg", "jpeg", "webp", "tif", "tiff", "bmp"]
+_MP4_PRESETS = [
+    "veryfast",
+    "ultrafast",
+    "superfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+]
+_PRORES_PROFILES = ["hq", "proxy", "lt", "standard", "4444", "4444xq"]
 
 _ROUTES_REGISTERED = False
 _LAST_WRITE_PAYLOAD: dict | None = None
@@ -190,6 +205,13 @@ class NLWrite:
                 "images": ("IMAGE",),
                 "mode": (["single", "sequence"],),
                 "name": ("STRING", {"default": "render"}),
+                "single_extension": (_SINGLE_EXTENSIONS,),
+                "sequence_save_png": ("BOOLEAN", {"default": True}),
+                "sequence_save_mp4": ("BOOLEAN", {"default": True}),
+                "sequence_save_mov": ("BOOLEAN", {"default": True}),
+                "sequence_mp4_crf": ("INT", {"default": 23, "min": 0, "max": 51}),
+                "sequence_mp4_preset": (_MP4_PRESETS,),
+                "sequence_mov_profile": (_PRORES_PROFILES,),
             },
         }
 
@@ -199,7 +221,19 @@ class NLWrite:
     CATEGORY = "NOLABEL/IO"
     OUTPUT_NODE = True
 
-    def write(self, images, mode: str, name: str):
+    def write(
+        self,
+        images,
+        mode: str,
+        name: str,
+        single_extension: str,
+        sequence_save_png: bool,
+        sequence_save_mp4: bool,
+        sequence_save_mov: bool,
+        sequence_mp4_crf: int,
+        sequence_mp4_preset: str,
+        sequence_mov_profile: str,
+    ):
         if torch is None or np is None or Image is None:
             raise RuntimeError("NL Write requires torch, numpy, and Pillow")
 
@@ -225,15 +259,8 @@ class NLWrite:
         version_int = _next_version(output_root, base_prefix)
         version_tag = f"{base_prefix}_v{version_int:03d}"
 
-        target_dir = output_root
-        format_name = "PNG"
-        if mode == "sequence":
-            target_dir = output_root / version_tag / format_name
-
-        if not _is_safe_path(target_dir, context):
+        if not _is_safe_path(output_root, context):
             raise ValueError("NL Write: output path is outside allowed roots.")
-
-        target_dir.mkdir(parents=True, exist_ok=True)
 
         preview_path = None
         saved = []
@@ -252,22 +279,115 @@ class NLWrite:
             _set_last_write_payload(ui_payload.get("nlwrite"))
             return {"ui": ui_payload, "result": ()}
 
+        width = image_list[0].size[0]
+        height = image_list[0].size[1]
+        fps_value = _preview_fps(context, fallback=24.0)
+        stats = {
+            "mode": mode,
+            "frame_count": len(image_list),
+            "fps": fps_value,
+            "width": width,
+            "height": height,
+            "outputs": [],
+        }
+
         if mode == "sequence":
-            sequence_dir = target_dir
-            for index, image in enumerate(image_list, start=1):
-                filename = f"{version_tag}_{index:04d}.png"
-                dest = sequence_dir / filename
-                image.save(dest, format="PNG")
-                saved.append(str(dest))
-            preview_path = sequence_dir
-            summary = f"Saved {len(saved)} frames to {sequence_dir}"
+            sequence_root = output_root / version_tag
+            sequence_dir = sequence_root / "PNG"
+            needs_frames = sequence_save_png or sequence_save_mp4 or sequence_save_mov
+            temp_dir = None
+            frame_dir = None
+            if needs_frames:
+                sequence_root.mkdir(parents=True, exist_ok=True)
+                if sequence_save_png:
+                    sequence_dir.mkdir(parents=True, exist_ok=True)
+                    frame_dir = sequence_dir
+                else:
+                    temp_dir = tempfile.TemporaryDirectory()
+                    frame_dir = Path(temp_dir.name)
+
+                for index, image in enumerate(image_list, start=1):
+                    filename = f"{version_tag}_{index:04d}.png"
+                    dest = frame_dir / filename
+                    image.save(dest, format="PNG")
+                    if sequence_save_png:
+                        saved.append(str(dest))
+                if sequence_save_png:
+                    stats["outputs"].append({"type": "png_sequence", "path": str(sequence_dir)})
+
+            outputs = []
+            preview_candidate = sequence_dir if sequence_save_png else None
+            if sequence_save_mp4:
+                mp4_path = sequence_root / f"{version_tag}.mp4"
+                if _ffmpeg_available() and needs_frames:
+                    if _encode_sequence_video(
+                        frame_dir,
+                        version_tag,
+                        mp4_path,
+                        fps_value,
+                        encoder="mp4",
+                        mp4_crf=sequence_mp4_crf,
+                        mp4_preset=sequence_mp4_preset,
+                        mov_profile=sequence_mov_profile,
+                    ):
+                        saved.append(str(mp4_path))
+                        outputs.append("mp4")
+                        stats["outputs"].append({"type": "mp4", "path": str(mp4_path)})
+                        preview_candidate = preview_candidate or mp4_path
+                else:
+                    outputs.append("mp4 (missing ffmpeg)")
+
+            if sequence_save_mov:
+                mov_path = sequence_root / f"{version_tag}.mov"
+                if _ffmpeg_available() and needs_frames:
+                    if _encode_sequence_video(
+                        frame_dir,
+                        version_tag,
+                        mov_path,
+                        fps_value,
+                        encoder="prores",
+                        mp4_crf=sequence_mp4_crf,
+                        mp4_preset=sequence_mp4_preset,
+                        mov_profile=sequence_mov_profile,
+                    ):
+                        saved.append(str(mov_path))
+                        outputs.append("mov")
+                        stats["outputs"].append({"type": "mov", "path": str(mov_path)})
+                        preview_candidate = preview_candidate or mov_path
+                else:
+                    outputs.append("mov (missing ffmpeg)")
+
+            if temp_dir is not None:
+                temp_dir.cleanup()
+
+            if not needs_frames:
+                summary = "No sequence outputs enabled."
+                preview_path = None
+            else:
+                if sequence_save_png:
+                    preview_path = preview_candidate or sequence_dir
+                else:
+                    preview_path = preview_candidate
+            parts = [f"Saved {len(image_list)} frames"]
+            if sequence_save_png:
+                parts.append(f"PNG sequence to {sequence_dir}")
+            if outputs:
+                parts.append("Outputs: " + ", ".join(outputs))
+            if needs_frames:
+                summary = " | ".join(parts)
         else:
-            filename = f"{version_tag}.png"
+            single_extension = _normalize_single_extension(single_extension)
+            single_format = _format_for_extension(single_extension)
+            filename = f"{version_tag}.{single_extension}"
+            target_dir = output_root
+            target_dir.mkdir(parents=True, exist_ok=True)
             dest = _dedupe_path(target_dir / filename)
-            image_list[0].save(dest, format="PNG")
+            image_list[0].save(dest, format=single_format)
             saved.append(str(dest))
             preview_path = dest
             summary = f"Saved 1 image to {dest}"
+            stats["extension"] = single_extension
+            stats["outputs"].append({"type": single_extension, "path": str(dest)})
 
         preview_url, preview_kind = _build_write_preview(preview_path, mode)
         ui_payload = {
@@ -277,6 +397,7 @@ class NLWrite:
                 "saved": saved,
                 "summary": summary,
                 "save_path": str(preview_path) if preview_path else "",
+                "stats": stats,
             }
         }
 
@@ -841,13 +962,114 @@ def _output_root_from_context(context: dict | None) -> Path:
 
 
 def _build_base_folder(context: dict | None, name: str) -> str:
-    shot = ""
+    parts = []
     if isinstance(context, dict):
-        shot = _safe_slug(context.get("shot"))
+        for key in ("project", "episode", "scene", "shot"):
+            value = _safe_slug(context.get(key))
+            if value:
+                parts.append(value)
     base_name = _safe_slug(name) or "render"
-    if shot:
-        return f"{shot}_{base_name}" if base_name else shot
-    return base_name
+    if base_name:
+        parts.append(base_name)
+    return "_".join(parts) if parts else "render"
+
+
+def _normalize_single_extension(value: str | None) -> str:
+    if not value:
+        return "png"
+    cleaned = str(value).strip().lower().lstrip(".")
+    return cleaned if cleaned in _SINGLE_EXTENSIONS else "png"
+
+
+def _format_for_extension(extension: str) -> str:
+    mapping = {
+        "png": "PNG",
+        "jpg": "JPEG",
+        "jpeg": "JPEG",
+        "webp": "WEBP",
+        "tif": "TIFF",
+        "tiff": "TIFF",
+        "bmp": "BMP",
+    }
+    return mapping.get(extension, "PNG")
+
+
+def _prores_profile(profile: str | None) -> int:
+    mapping = {
+        "proxy": 0,
+        "lt": 1,
+        "standard": 2,
+        "hq": 3,
+        "4444": 4,
+        "4444xq": 5,
+    }
+    return mapping.get((profile or "").strip().lower(), 3)
+
+
+def _prores_pix_fmt(profile: str | None) -> str:
+    profile = (profile or "").strip().lower()
+    if profile in {"4444", "4444xq"}:
+        return "yuv444p10le"
+    return "yuv422p10le"
+
+
+def _encode_sequence_video(
+    frame_dir: Path | None,
+    version_tag: str,
+    output_path: Path,
+    fps: float,
+    *,
+    encoder: str,
+    mp4_crf: int,
+    mp4_preset: str,
+    mov_profile: str,
+) -> bool:
+    if frame_dir is None or not frame_dir.exists():
+        return False
+    if not _ffmpeg_available():
+        return False
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fps_value = max(1.0, float(fps)) if fps else 24.0
+    input_pattern = str(frame_dir / f"{version_tag}_%04d.png")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-framerate",
+        f"{fps_value:.6f}",
+        "-start_number",
+        "1",
+        "-i",
+        input_pattern,
+    ]
+    if encoder == "mp4":
+        preset = mp4_preset if mp4_preset in _MP4_PRESETS else "veryfast"
+        crf_value = max(0, min(51, int(mp4_crf)))
+        cmd += [
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            str(crf_value),
+            "-preset",
+            preset,
+            "-movflags",
+            "+faststart",
+        ]
+    elif encoder == "prores":
+        profile_num = _prores_profile(mov_profile)
+        pix_fmt = _prores_pix_fmt(mov_profile)
+        cmd += ["-c:v", "prores_ks", "-profile:v", str(profile_num), "-pix_fmt", pix_fmt]
+    else:
+        return False
+    cmd.append(str(output_path))
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except Exception:
+        return False
+    if result.returncode != 0:
+        return False
+    return output_path.exists()
 
 
 def _next_version(output_root: Path, base_prefix: str) -> int:
@@ -893,6 +1115,11 @@ def _tensor_to_images(images) -> list[Image.Image]:
 def _build_write_preview(path: Path | None, mode: str) -> tuple[str, str]:
     if path is None:
         return "", "image"
+    if path.is_file():
+        ext = path.suffix.lower()
+        if ext in _VIDEO_EXTS:
+            return f"/nl/viewmedia?source={_quote(str(path))}&mode=video", "video"
+        return f"/nl/viewmedia?source={_quote(str(path))}&mode=image", "image"
     if mode == "sequence":
         if _ffmpeg_available():
             return f"/nl/viewmedia?source={_quote(str(path))}&mode=sequence&anim=1", "video"
@@ -1566,7 +1793,10 @@ def _register_routes():
                         chunk = process.stdout.read(64 * 1024)
                         if not chunk:
                             break
-                        await response.write(chunk)
+                        try:
+                            await response.write(chunk)
+                        except (ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
+                            break
                 finally:
                     if process.stdout:
                         process.stdout.close()
@@ -1578,7 +1808,10 @@ def _register_routes():
                         concat_path.unlink(missing_ok=True)
                     except Exception:
                         pass
-                await response.write_eof()
+                try:
+                    await response.write_eof()
+                except (ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
+                    pass
                 return response
             if resize_to and Image is not None:
                 image = _open_image(first_frame)
@@ -1637,7 +1870,10 @@ def _register_routes():
                     chunk = process.stdout.read(64 * 1024)
                     if not chunk:
                         break
-                    await response.write(chunk)
+                    try:
+                        await response.write(chunk)
+                    except (ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
+                        break
             finally:
                 if process.stdout:
                     process.stdout.close()
@@ -1645,7 +1881,10 @@ def _register_routes():
                     process.wait(timeout=2)
                 except Exception:
                     process.kill()
-            await response.write_eof()
+            try:
+                await response.write_eof()
+            except (ClientConnectionResetError, ConnectionResetError, BrokenPipeError):
+                pass
             return response
 
         if not _is_safe_path(path, context):

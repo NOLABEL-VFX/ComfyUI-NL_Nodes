@@ -5,6 +5,17 @@ const EXTENSION_NAME = "NOLABEL.NLReadPreview";
 const NODE_NAME = "NLRead";
 const STYLE_ID = "nl-read-preview-style";
 const REFRESH_KEY = "__nlReadRefreshCallbacks";
+const READ_WIDGET_STATE_KEY = "__nlReadWidgetValues";
+const READ_WIDGET_NAMES = [
+    "source",
+    "max_frames",
+    "skip_first",
+    "every_nth",
+    "force_resize",
+    "resize_mode",
+    "resize_width",
+    "resize_height",
+];
 
 function ensureStyles() {
     if (document.getElementById(STYLE_ID)) return;
@@ -59,7 +70,7 @@ function ensureStyles() {
         .nl-read-stats {
             width: 100%;
             min-height: 24px;
-            padding: 4px 6px;
+            padding: 6px 8px;
             box-sizing: border-box;
             background: #0b0b0b;
             color: #9ca3af;
@@ -71,8 +82,13 @@ function ensureStyles() {
             word-break: break-word;
             display: block;
             height: auto;
-            overflow: visible;
+            max-height: 96px;
+            overflow: auto;
             margin-bottom: 10px;
+        }
+        .nl-read-stats-strong {
+            font-weight: 600;
+            color: #e5e7eb;
         }
     `;
     document.head.appendChild(style);
@@ -112,6 +128,37 @@ function ensureComboWidget(node, widget) {
     }
     node.widgets.splice(widgetIndex, 1, newWidget);
     return newWidget;
+}
+
+function persistWidgetState(node) {
+    if (!node) return;
+    const state = {};
+    for (const name of READ_WIDGET_NAMES) {
+        const widget = findWidget(node, name);
+        if (!widget) continue;
+        state[name] = widget.value;
+    }
+    node.properties = node.properties || {};
+    node.properties[READ_WIDGET_STATE_KEY] = state;
+}
+
+function restoreWidgetState(node) {
+    const state = node?.properties?.[READ_WIDGET_STATE_KEY];
+    if (!state || typeof state !== "object") return;
+    for (const name of READ_WIDGET_NAMES) {
+        if (state[name] === undefined) continue;
+        const widget = findWidget(node, name);
+        if (!widget) continue;
+        if (widget.value === state[name]) continue;
+        if (widget.type === "combo") {
+            const values = widget.options?.values || [];
+            if (!values.includes(state[name])) {
+                widget.options = widget.options || {};
+                widget.options.values = [state[name], ...values];
+            }
+        }
+        widget.value = state[name];
+    }
 }
 
 function attachPreview(node) {
@@ -227,6 +274,16 @@ function attachPreview(node) {
 
     let lastResolve = null;
     let sourceWidget = ensureComboWidget(node, findWidget(node, "source"));
+    restoreWidgetState(node);
+    const saveState = () => persistWidgetState(node);
+    const readState = (node.__nlReadState ||= { pinnedSource: "" });
+    const storedPinned = node.properties?.__nlReadPinnedSource;
+    if (storedPinned && !readState.pinnedSource) {
+        readState.pinnedSource = storedPinned;
+    }
+    if (sourceWidget && (!sourceWidget.value || sourceWidget.value === "null") && readState.pinnedSource) {
+        sourceWidget.value = readState.pinnedSource;
+    }
     const resizeModeWidget = findWidget(node, "force_resize");
     const resizeStrategyWidget = findWidget(node, "resize_mode");
     const resizeWidthWidget = findWidget(node, "resize_width");
@@ -318,7 +375,17 @@ function attachPreview(node) {
         if (statsState.path) {
             parts.push(basename(statsState.path));
         }
-        stats.textContent = parts.join(" | ");
+        stats.innerHTML = "";
+        parts.forEach((part, index) => {
+            if (index === 0) {
+                const strong = document.createElement("span");
+                strong.className = "nl-read-stats-strong";
+                strong.textContent = part;
+                stats.appendChild(strong);
+            } else {
+                stats.appendChild(document.createTextNode(" | " + part));
+            }
+        });
         requestAnimationFrame(syncStatsHeight);
     };
 
@@ -351,12 +418,20 @@ function attachPreview(node) {
         if (!sourceWidget) {
             return;
         }
-        const current = sourceWidget.value;
+        const widgetValue = sourceWidget.value;
+        const current =
+            widgetValue && widgetValue !== "null"
+                ? widgetValue
+                : readState.pinnedSource || "";
         const values = current && !entries.includes(current) ? [current, ...entries] : entries;
         sourceWidget.options = sourceWidget.options || {};
         sourceWidget.options.values = values.length ? values : [""];
-        if (!values.length) {
-            sourceWidget.value = current || "";
+        if (current && sourceWidget.value !== current) {
+            sourceWidget.value = current;
+            saveState();
+        } else if (!values.length) {
+            sourceWidget.value = "";
+            saveState();
         }
         node.setDirtyCanvas(true, true);
     };
@@ -365,14 +440,40 @@ function attachPreview(node) {
 
     const updatePreview = async () => {
         const sourceWidget = findWidget(node, "source");
-        const source = sourceWidget?.value || "";
-        const skipFirst = Math.max(0, Number(findWidget(node, "skip_first")?.value || 0));
-        const everyNth = Math.max(1, Number(findWidget(node, "every_nth")?.value || 1));
-        const maxFrames = Math.max(0, Number(findWidget(node, "max_frames")?.value || 0));
-        const resizeMode = resizeModeWidget?.value || "none";
-        const resizeStrategy = resizeStrategyWidget?.value || "stretch";
-        const resizeWidth = Math.max(0, Number(resizeWidthWidget?.value || 0));
-        const resizeHeight = Math.max(0, Number(resizeHeightWidget?.value || 0));
+        const sourceValue = sourceWidget?.value;
+        const source =
+            sourceValue && sourceValue !== "null" ? sourceValue : readState.pinnedSource || "";
+        const skipFirstWidget = findWidget(node, "skip_first");
+        const everyNthWidget = findWidget(node, "every_nth");
+        const maxFramesWidget = findWidget(node, "max_frames");
+        const readNumber = (widget, fallback) => {
+            if (!widget) return fallback;
+            const parsed = Number(widget.value);
+            if (!Number.isFinite(parsed)) {
+                widget.value = fallback;
+                return fallback;
+            }
+            return parsed;
+        };
+        const skipFirst = Math.max(0, readNumber(skipFirstWidget, 0));
+        const everyNth = Math.max(1, readNumber(everyNthWidget, 1));
+        const maxFrames = Math.max(0, readNumber(maxFramesWidget, 120));
+        const resizeModeValues = resizeModeWidget?.options?.values || ["none", "context", "custom"];
+        const resizeMode = resizeModeValues.includes(resizeModeWidget?.value)
+            ? resizeModeWidget?.value
+            : "none";
+        if (resizeModeWidget && resizeModeWidget.value !== resizeMode) {
+            resizeModeWidget.value = resizeMode;
+        }
+        const resizeStrategyValues = resizeStrategyWidget?.options?.values || ["stretch", "fit", "fill"];
+        const resizeStrategy = resizeStrategyValues.includes(resizeStrategyWidget?.value)
+            ? resizeStrategyWidget?.value
+            : "stretch";
+        if (resizeStrategyWidget && resizeStrategyWidget.value !== resizeStrategy) {
+            resizeStrategyWidget.value = resizeStrategy;
+        }
+        const resizeWidth = Math.max(0, readNumber(resizeWidthWidget, 0));
+        const resizeHeight = Math.max(0, readNumber(resizeHeightWidget, 0));
 
         const url = `/nl_read/resolve?source=${encodeURIComponent(source)}&mode=auto&skip_first=${encodeURIComponent(
             skipFirst
@@ -400,6 +501,15 @@ function attachPreview(node) {
         statsState.height = null;
         statsState.duration = null;
         statsState.path = payload?.resolved_path || source;
+        if (payload?.resolved_path) {
+            readState.pinnedSource = payload.resolved_path;
+            node.properties = node.properties || {};
+            node.properties.__nlReadPinnedSource = payload.resolved_path;
+            if (sourceWidget && sourceWidget.value !== payload.resolved_path) {
+                sourceWidget.value = payload.resolved_path;
+                saveState();
+            }
+        }
 
         updateFrameControls();
 
@@ -453,6 +563,17 @@ function attachPreview(node) {
             if (typeof original === "function") {
                 original.apply(this, arguments);
             }
+            if (sourceWidget.value === "") {
+                readState.pinnedSource = "";
+                if (node.properties) {
+                    node.properties.__nlReadPinnedSource = "";
+                }
+            } else {
+                readState.pinnedSource = sourceWidget.value || readState.pinnedSource;
+                node.properties = node.properties || {};
+                node.properties.__nlReadPinnedSource = readState.pinnedSource;
+            }
+            saveState();
             updatePreview();
         };
     }
@@ -464,6 +585,7 @@ function attachPreview(node) {
                 original.apply(this, arguments);
             }
             updateResizeFields();
+            saveState();
             updatePreview();
         };
         updateResizeFields();
@@ -475,6 +597,7 @@ function attachPreview(node) {
             if (typeof original === "function") {
                 original.apply(this, arguments);
             }
+            saveState();
             updatePreview();
         };
     }
@@ -487,6 +610,7 @@ function attachPreview(node) {
             if (typeof original === "function") {
                 original.apply(this, arguments);
             }
+            saveState();
             updatePreview();
         };
     }
@@ -499,6 +623,7 @@ function attachPreview(node) {
             if (typeof original === "function") {
                 original.apply(this, arguments);
             }
+            saveState();
             updatePreview();
         };
     }
@@ -543,6 +668,7 @@ function attachPreview(node) {
             if (typeof sourceWidget.callback === "function") {
                 sourceWidget.callback(sourceWidget.value);
             }
+            saveState();
         }
     };
 
@@ -567,6 +693,12 @@ function attachPreview(node) {
         fileInput.click();
     });
 
+    setTimeout(() => {
+        refreshList();
+        updatePreview();
+        saveState();
+    }, 0);
+
     const onRemoved = node.onRemoved;
     node.onRemoved = function () {
         window.removeEventListener("nl-workflow-cache-updated", cacheUpdatedHandler);
@@ -578,6 +710,12 @@ function attachPreview(node) {
 
     requestAnimationFrame(refreshList);
     requestAnimationFrame(updatePreview);
+
+    node.__nlReadUI = {
+        restoreState: () => restoreWidgetState(node),
+        saveState,
+        updatePreview,
+    };
 }
 
 app.registerExtension({
@@ -586,9 +724,16 @@ app.registerExtension({
         const nodeName = nodeData?.name || nodeType?.name || "";
         if (nodeName !== NODE_NAME) return;
         const onNodeCreated = nodeType.prototype.onNodeCreated;
+        const onConfigure = nodeType.prototype.onConfigure;
         nodeType.prototype.onNodeCreated = function () {
             const result = onNodeCreated?.apply(this, arguments);
             attachPreview(this);
+            return result;
+        };
+        nodeType.prototype.onConfigure = function () {
+            const result = onConfigure?.apply(this, arguments);
+            this.__nlReadUI?.restoreState?.();
+            this.__nlReadUI?.updatePreview?.();
             return result;
         };
     },
