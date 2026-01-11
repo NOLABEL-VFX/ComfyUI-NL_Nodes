@@ -17,6 +17,13 @@ const WRITE_WIDGET_NAMES = [
     "sequence_mp4_preset",
     "sequence_mov_profile",
 ];
+const MIN_NODE_WIDTH = 390;
+const MIN_NODE_HEIGHT = 360;
+const MIN_PREVIEW_HEIGHT = 80;
+const CONTROLS_OVERLAP = 0;
+const PANEL_GAP = 4;
+const EXTRA_NODE_PADDING = 40;
+const AUTO_SIZE_KEY = "__nlWriteAutoSized";
 let GLOBAL_LISTENER_ATTACHED = false;
 let LAST_GLOBAL_FETCH_AT = 0;
 let LAST_PAYLOAD_SIGNATURE = "";
@@ -31,7 +38,7 @@ function ensureStyles() {
             flex-direction: column;
             width: 100%;
             height: 100%;
-            gap: 8px;
+            gap: 4px;
         }
         .nl-write-preview {
             width: 100%;
@@ -63,6 +70,19 @@ function ensureStyles() {
         .nl-write-preview .nl-write-message {
             display: none;
         }
+        .nl-write-header {
+            width: 100%;
+            padding: 6px 8px;
+            box-sizing: border-box;
+            background: #0f0f0f;
+            color: #d1d5db;
+            border: 1px solid #1f2937;
+            border-radius: 6px;
+            font-size: 11px;
+            font-weight: 600;
+            line-height: 1.4;
+            letter-spacing: 0.01em;
+        }
         .nl-write-meta {
             width: 100%;
             min-height: 36px;
@@ -78,7 +98,6 @@ function ensureStyles() {
             word-break: break-word;
             margin-top: 8px;
             margin-top: auto;
-            max-height: 96px;
             overflow: auto;
         }
         .nl-write-meta .nl-write-stats {
@@ -87,15 +106,57 @@ function ensureStyles() {
             color: #e5e7eb;
             margin-bottom: 4px;
         }
-        .nl-write-meta .nl-write-path {
-            display: block;
-            margin-top: 4px;
+        .nl-write-meta .nl-write-paths {
+            margin-top: 6px;
             color: #9ca3af;
+            font-size: 11px;
+        }
+        .nl-write-meta .nl-write-paths summary {
+            cursor: pointer;
+            color: #cfcfcf;
+            font-size: 10px;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+        }
+        .nl-write-meta .nl-write-paths[open] summary {
+            color: #e6e6e6;
+        }
+        .nl-write-meta .nl-write-path-list {
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+            margin-top: 6px;
+        }
+        .nl-write-meta .nl-write-path-row {
+            display: grid;
+            grid-template-columns: auto 1fr auto;
+            gap: 6px;
+            align-items: center;
+        }
+        .nl-write-meta .nl-write-path-label {
+            font-size: 10px;
+            color: #9aa0a6;
+            text-transform: uppercase;
+            letter-spacing: 0.02em;
+            white-space: nowrap;
+        }
+        .nl-write-meta .nl-write-path-value {
+            color: #e5e7eb;
+            word-break: break-word;
+        }
+        .nl-write-meta .nl-write-path-copy {
+            border: 1px solid #2a2a2a;
+            background: #111;
+            color: #d1d5db;
+            border-radius: 4px;
+            padding: 2px 6px;
+            font-size: 10px;
+            cursor: pointer;
         }
         .nl-write-controls {
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 4px;
             padding: 8px;
             border-radius: 6px;
             border: 1px solid #2e2e2e;
@@ -107,7 +168,7 @@ function ensureStyles() {
         .nl-write-controls .nl-write-group {
             display: flex;
             flex-direction: column;
-            gap: 8px;
+            gap: 4px;
         }
         .nl-write-controls .nl-write-group-title {
             font-size: 10px;
@@ -116,7 +177,7 @@ function ensureStyles() {
         .nl-write-controls .nl-write-row {
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 4px;
         }
         .nl-write-controls .nl-write-row label {
             min-width: 86px;
@@ -183,7 +244,7 @@ function ensureStyles() {
             flex: 1 1 auto;
             display: flex;
             align-items: center;
-            gap: 8px;
+            gap: 4px;
         }
         .nl-write-controls input[type="range"] {
             flex: 1 1 auto;
@@ -197,6 +258,22 @@ function ensureStyles() {
         .nl-write-controls .nl-write-hint {
             font-size: 11px;
             color: #6b7280;
+        }
+        .nl-write-controls .nl-write-settings {
+            border: 1px solid #2a2a2a;
+            border-radius: 6px;
+            padding: 6px 8px;
+            background: #0f0f0f;
+        }
+        .nl-write-controls .nl-write-settings summary {
+            cursor: pointer;
+            color: #cfcfcf;
+            font-size: 10px;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+        }
+        .nl-write-controls .nl-write-settings[open] summary {
+            color: #e6e6e6;
         }
     `;
     document.head.appendChild(style);
@@ -264,21 +341,58 @@ function attachPreview(node) {
     const previewWidget = node.addDOMWidget("nlwrite_preview", "nlwrite_preview", panel, { serialize: false });
     previewWidget.serialize = false;
     previewWidget.options.canvasOnly = false;
+    let previewHeightObserver = null;
+    const attachPreviewHeightObserver = () => {
+        if (previewHeightObserver) return;
+        const domWidget = panel.closest(".dom-widget");
+        if (!domWidget) return;
+        const clearHeight = () => {
+            if (domWidget.style.height) {
+                domWidget.style.removeProperty("height");
+            }
+        };
+        clearHeight();
+        previewHeightObserver = new MutationObserver(clearHeight);
+        previewHeightObserver.observe(domWidget, { attributes: true, attributeFilter: ["style"] });
+    };
+    requestAnimationFrame(attachPreviewHeightObserver);
+
+    let metaHeightObserver = null;
+    const attachMetaHeightObserver = () => {
+        if (metaHeightObserver) return;
+        metaHeightObserver = new ResizeObserver(() => {
+            panelState.metaHeight = getMetaHeight();
+            scheduleNodeFit();
+        });
+        metaHeightObserver.observe(meta);
+    };
+    requestAnimationFrame(attachMetaHeightObserver);
 
     const meta = document.createElement("div");
     meta.className = "nl-write-meta";
+    const header = document.createElement("div");
+    header.className = "nl-write-header";
+    header.textContent = "Last render: waiting for output.";
+    header.style.display = "none";
     const stats = document.createElement("div");
     stats.className = "nl-write-stats";
     stats.textContent = "No preview.";
-    const pathEl = document.createElement("div");
-    pathEl.className = "nl-write-path";
-    pathEl.textContent = "No output yet.";
+    const pathDetails = document.createElement("details");
+    pathDetails.className = "nl-write-paths";
+    pathDetails.open = true;
+    const pathSummary = document.createElement("summary");
+    pathSummary.textContent = "Paths";
+    const pathList = document.createElement("div");
+    pathList.className = "nl-write-path-list";
+    pathDetails.appendChild(pathSummary);
+    pathDetails.appendChild(pathList);
     meta.appendChild(stats);
-    meta.appendChild(pathEl);
+    meta.appendChild(pathDetails);
+    panel.appendChild(header);
     panel.appendChild(container);
     panel.appendChild(meta);
 
-    const panelState = { controlsHeight: 200 };
+    const panelState = { controlsHeight: 200, headerHeight: 28, metaHeight: 36 };
     const getWidgetMargin = () => {
         const margin = window?.LiteGraph?.NODE_WIDGET_MARGIN;
         return Number.isFinite(margin) ? margin : 4;
@@ -313,9 +427,36 @@ function attachPreview(node) {
         const titleHeight = window?.LiteGraph?.NODE_TITLE_HEIGHT;
         return Number.isFinite(titleHeight) ? titleHeight : 24;
     };
+    const getMetaHeight = () => {
+        const measured = meta.scrollHeight || meta.getBoundingClientRect().height || 0;
+        return Math.max(36, Math.ceil(measured));
+    };
+    const getHeaderHeight = () => {
+        const measured = header.scrollHeight || header.getBoundingClientRect().height || 0;
+        return Math.max(0, Math.ceil(measured));
+    };
+    const getMinNodeHeight = () => {
+        panelState.metaHeight = getMetaHeight();
+        panelState.headerHeight = getHeaderHeight();
+        const base =
+            panelState.controlsHeight +
+            getTitleHeight() +
+            MIN_PREVIEW_HEIGHT +
+            panelState.headerHeight +
+            panelState.metaHeight +
+            PANEL_GAP +
+            EXTRA_NODE_PADDING;
+        return Math.max(base, MIN_NODE_HEIGHT);
+    };
     const computePanelHeight = () => {
         const baseHeight = node.size?.[1] || 560;
-        const available = baseHeight - panelState.controlsHeight - getTitleHeight();
+        const available =
+            baseHeight -
+            panelState.controlsHeight -
+            getTitleHeight() -
+            getHeaderHeight() -
+            getMetaHeight() -
+            PANEL_GAP;
         return Math.max(0, Math.floor(available));
     };
     const requestLayout = () => {
@@ -332,14 +473,16 @@ function attachPreview(node) {
         const controls = document.createElement("div");
         controls.className = "nl-write-controls";
 
-        const createGroup = (title) => {
+        const createGroup = (title, parent = controls) => {
             const group = document.createElement("div");
             group.className = "nl-write-group";
-            const label = document.createElement("div");
-            label.className = "nl-write-group-title";
-            label.textContent = title;
-            group.appendChild(label);
-            controls.appendChild(group);
+            if (title) {
+                const label = document.createElement("div");
+                label.className = "nl-write-group-title";
+                label.textContent = title;
+                group.appendChild(label);
+            }
+            parent.appendChild(group);
             return group;
         };
 
@@ -353,7 +496,7 @@ function attachPreview(node) {
             return row;
         };
 
-        const basicsGroup = createGroup("Basics");
+        const basicsGroup = createGroup(null);
         const nameInput = document.createElement("input");
         nameInput.type = "text";
         nameInput.placeholder = "Base name";
@@ -371,11 +514,12 @@ function attachPreview(node) {
         modeRow.appendChild(modeSequence);
         basicsGroup.appendChild(createRow("Mode", modeRow));
 
-        const singleGroup = createGroup("Single Output");
+        const singleGroup = createGroup(null);
+        singleGroup.style.paddingBottom = "12px";
         const singleExtensionSelect = document.createElement("select");
         singleGroup.appendChild(createRow("Format", singleExtensionSelect));
 
-        const sequenceGroup = createGroup("Sequence Outputs");
+        const sequenceGroup = createGroup(null);
         const sequenceRow = document.createElement("div");
         sequenceRow.style.display = "flex";
         sequenceRow.style.gap = "8px";
@@ -396,7 +540,15 @@ function attachPreview(node) {
         sequenceRow.appendChild(toggleMov);
         sequenceGroup.appendChild(createRow("Save", sequenceRow));
 
-        const encodingGroup = createGroup("Encoding");
+        const settingsDetails = document.createElement("details");
+        settingsDetails.className = "nl-write-settings";
+        settingsDetails.open = false;
+        const settingsSummary = document.createElement("summary");
+        settingsSummary.textContent = "Settings";
+        settingsDetails.appendChild(settingsSummary);
+        controls.appendChild(settingsDetails);
+
+        const encodingGroup = createGroup("Compression", settingsDetails);
         const crfWrap = document.createElement("div");
         crfWrap.className = "nl-write-range";
         const crfInput = document.createElement("input");
@@ -421,6 +573,13 @@ function attachPreview(node) {
         });
         controlsWidget.serialize = false;
         controlsWidget.options.canvasOnly = false;
+        const widgetList = node.widgets || [];
+        const previewIndex = widgetList.indexOf(previewWidget);
+        const controlsIndex = widgetList.indexOf(controlsWidget);
+        if (previewIndex !== -1 && controlsIndex !== -1 && controlsIndex > previewIndex) {
+            widgetList.splice(controlsIndex, 1);
+            widgetList.splice(previewIndex, 0, controlsWidget);
+        }
 
         const widgetMap = {
             name: findWidget(node, "name"),
@@ -496,7 +655,7 @@ function attachPreview(node) {
             modeSequence.classList.toggle("is-active", modeValue === "sequence");
             singleGroup.style.display = modeValue === "single" ? "flex" : "none";
             sequenceGroup.style.display = modeValue === "sequence" ? "flex" : "none";
-            encodingGroup.style.display = modeValue === "sequence" ? "flex" : "none";
+            settingsDetails.style.display = modeValue === "sequence" ? "block" : "none";
 
             updateSelectOptions(singleExtensionSelect, widgetMap.singleExtension);
             if (widgetMap.singleExtension) {
@@ -526,8 +685,17 @@ function attachPreview(node) {
         };
 
         const updateControlsHeight = () => {
-            return Math.ceil(controls.scrollHeight) + 6;
+            const rawHeight = Math.ceil(controls.scrollHeight) + 6;
+            const height = Math.max(0, rawHeight - CONTROLS_OVERLAP);
+            panelState.controlsHeight = height;
+            return height;
         };
+
+        settingsDetails.addEventListener("toggle", () => {
+            updateControlsHeight();
+            node.__nlWriteUI?.enforceNodeSize?.({ shrinkHeight: !settingsDetails.open });
+            node.setDirtyCanvas(true, true);
+        });
 
         modeSingle.addEventListener("click", () => {
             setWidgetValue(widgetMap.mode, "single");
@@ -566,6 +734,22 @@ function attachPreview(node) {
             setWidgetValue(widgetMap.movProfile, movProfileSelect.value);
         });
 
+        let heightObserver = null;
+        const attachHeightObserver = () => {
+            if (heightObserver) return;
+            const domWidget = controls.closest(".dom-widget");
+            if (!domWidget) return;
+            const clearHeight = () => {
+                if (domWidget.style.height) {
+                    domWidget.style.removeProperty("height");
+                }
+            };
+            clearHeight();
+            heightObserver = new MutationObserver(clearHeight);
+            heightObserver.observe(domWidget, { attributes: true, attributeFilter: ["style"] });
+        };
+        requestAnimationFrame(attachHeightObserver);
+
         controlsWidget.computeSize = (width) => {
             const height = updateControlsHeight();
             return [width, height];
@@ -573,6 +757,20 @@ function attachPreview(node) {
 
         syncFromWidgets();
         updateControlsHeight();
+        let controlsResizeObserver = null;
+        const attachControlsObserver = () => {
+            if (controlsResizeObserver) return;
+            controlsResizeObserver = new ResizeObserver(() => {
+                updateControlsHeight();
+                node.__nlWriteUI?.enforceNodeSize?.({ shrinkHeight: !settingsDetails.open });
+                node.setDirtyCanvas(true, true);
+            });
+            controlsResizeObserver.observe(controls);
+            if (node.__nlWriteUI) {
+                node.__nlWriteUI.controlsResizeObserver = controlsResizeObserver;
+            }
+        };
+        requestAnimationFrame(attachControlsObserver);
 
         return {
             controlsWidget,
@@ -580,25 +778,212 @@ function attachPreview(node) {
             updateControlsHeight,
             widgetMap,
             groups: { singleGroup, sequenceGroup, encodingGroup },
+            heightObserver,
+            controlsResizeObserver,
         };
     };
 
     const statsState = {
         mode: "",
         kind: "",
+        generatedAt: null,
+        hasOutput: false,
+        saved: [],
         frameCount: null,
         fps: null,
         width: null,
         height: null,
         extension: "",
         outputs: [],
-        path: "",
+        outputsDetail: [],
+    };
+
+    const formatOutputLabel = (type) => {
+        const normalized = String(type || "").toLowerCase();
+        if (normalized === "png_sequence") return "png seq";
+        if (normalized === "mp4") return "mp4 proxy";
+        if (normalized === "mov") return "mov hq";
+        if (!normalized) return "output";
+        return normalized;
+    };
+
+    const normalizePath = (value) => String(value || "").replace(/\\/g, "/");
+
+    const toTimestampMs = (value) => {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric) || numeric <= 0) return null;
+        return numeric < 1_000_000_000_000 ? Math.round(numeric * 1000) : Math.round(numeric);
+    };
+
+    const formatTimestamp = (timestampMs) => {
+        if (!Number.isFinite(timestampMs)) return "Last render: waiting for output.";
+        const date = new Date(timestampMs);
+        if (Number.isNaN(date.getTime())) return "Last render: waiting for output.";
+        const dateLabel = new Intl.DateTimeFormat(undefined, {
+            month: "short",
+            day: "2-digit",
+            year: "numeric",
+        }).format(date);
+        const timeLabel = new Intl.DateTimeFormat(undefined, {
+            hour: "2-digit",
+            minute: "2-digit",
+            hour12: false,
+        }).format(date);
+        return `Last render · ${dateLabel} · ${timeLabel}`;
+    };
+
+    const updateHeaderDisplay = () => {
+        if (!statsState.hasOutput) {
+            header.style.display = "none";
+            return;
+        }
+        header.style.display = "block";
+        header.textContent = formatTimestamp(statsState.generatedAt);
+    };
+
+    const isFilePath = (value) => /\/[^/]+\.[^/]+$/.test(normalizePath(value));
+
+    const dirname = (value) => {
+        const normalized = normalizePath(value);
+        const index = normalized.lastIndexOf("/");
+        return index === -1 ? normalized : normalized.slice(0, index);
+    };
+
+    const getCommonPathPrefix = (paths) => {
+        if (!paths.length) return "";
+        const segments = paths.map((path) => normalizePath(path).split("/").filter(Boolean));
+        let prefixLength = segments[0].length;
+        for (let i = 1; i < segments.length; i += 1) {
+            let j = 0;
+            const current = segments[i];
+            while (j < prefixLength && j < current.length && segments[0][j] === current[j]) {
+                j += 1;
+            }
+            prefixLength = j;
+            if (prefixLength === 0) break;
+        }
+        if (!prefixLength) return "";
+        return "/" + segments[0].slice(0, prefixLength).join("/");
+    };
+
+    const getRelativePreviewPath = (value, base) => {
+        const normalized = normalizePath(value);
+        const normalizedBase = normalizePath(base);
+        if (normalizedBase && normalized.startsWith(normalizedBase + "/")) {
+            return normalized.slice(normalizedBase.length + 1);
+        }
+        return normalized;
+    };
+
+    const deriveSequencePattern = () => {
+        const saved = Array.isArray(statsState.saved) ? statsState.saved : [];
+        const pngPath = saved.find((path) => /\.png$/i.test(path || ""));
+        if (!pngPath) return null;
+        const normalized = normalizePath(pngPath);
+        const filename = normalized.split("/").pop() || "";
+        const match = filename.match(/^(.*?)(\d+)(\.[^.]+)$/);
+        if (!match) return normalized;
+        const [, prefix, digits, ext] = match;
+        const hashes = "#".repeat(digits.length);
+        const dir = dirname(normalized);
+        return `${dir}/${prefix}${hashes}${ext}`;
+    };
+
+    const getDisplayPath = (entry) => {
+        if (!entry?.path) return "";
+        if (entry.type === "png_sequence") {
+            const pattern = deriveSequencePattern();
+            if (pattern) return pattern;
+            return `${normalizePath(entry.path)}/####.png`;
+        }
+        return entry.path;
+    };
+
+    const copyText = async (text) => {
+        if (!text) return;
+        try {
+            if (navigator?.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text);
+                return;
+            }
+        } catch (err) {
+            console.warn("[NL Write] Clipboard API failed", err);
+        }
+        const textarea = document.createElement("textarea");
+        textarea.value = text;
+        textarea.style.position = "fixed";
+        textarea.style.left = "-9999px";
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+            document.execCommand("copy");
+        } catch (err) {
+            console.warn("[NL Write] Clipboard fallback failed", err);
+        }
+        document.body.removeChild(textarea);
+    };
+
+    const renderPaths = () => {
+        pathList.innerHTML = "";
+        const entries = statsState.outputsDetail || [];
+        if (!entries.length) {
+            pathDetails.style.display = "none";
+            return;
+        }
+        const displayPaths = entries.map((entry) => getDisplayPath(entry)).filter(Boolean);
+        const baseCandidates = displayPaths
+            .filter(Boolean)
+            .map((value) => (isFilePath(value) ? dirname(value) : value));
+        const commonBase = getCommonPathPrefix(baseCandidates);
+        pathDetails.style.display = "block";
+        for (const entry of entries) {
+            const row = document.createElement("div");
+            row.className = "nl-write-path-row";
+            const label = document.createElement("div");
+            label.className = "nl-write-path-label";
+            label.textContent = formatOutputLabel(entry.type);
+            const value = document.createElement("div");
+            value.className = "nl-write-path-value";
+            const displayPath = getDisplayPath(entry);
+            value.textContent = displayPath ? getRelativePreviewPath(displayPath, commonBase) : "";
+            const copyBtn = document.createElement("button");
+            copyBtn.type = "button";
+            copyBtn.className = "nl-write-path-copy";
+            copyBtn.textContent = "Copy";
+            copyBtn.addEventListener("click", (event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                void copyText(displayPath || "");
+            });
+            row.appendChild(label);
+            row.appendChild(value);
+            row.appendChild(copyBtn);
+            pathList.appendChild(row);
+        }
+    };
+
+    const scheduleNodeFit = () => {
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                estimateControlsHeight();
+                panelState.metaHeight = getMetaHeight();
+                panelState.headerHeight = getHeaderHeight();
+                const minHeight = getMinNodeHeight();
+                if (node.size && node.size[1] < minHeight) {
+                    node.setSize([Math.max(node.size[0], MIN_NODE_WIDTH), minHeight]);
+                }
+                node.setDirtyCanvas(true, true);
+            });
+        });
     };
 
     const updateStatsDisplay = () => {
         const mode = statsState.mode || statsState.kind;
         if (!mode) {
             stats.textContent = "No preview.";
+            updateHeaderDisplay();
+            renderPaths();
+            scheduleNodeFit();
             return;
         }
         const label = mode === "sequence" ? "Sequence" : "Image";
@@ -616,14 +1001,10 @@ function attachPreview(node) {
         } else if (statsState.extension) {
             parts.push(statsState.extension.toUpperCase());
         }
-        if (Array.isArray(statsState.outputs) && statsState.outputs.length) {
-            parts.push(statsState.outputs.join(", "));
-        }
-        if (statsState.path) {
-            const basename = statsState.path.split(/[\\/]/).pop() || statsState.path;
-            parts.push(basename);
-        }
         stats.textContent = parts.join(" | ");
+        updateHeaderDisplay();
+        renderPaths();
+        scheduleNodeFit();
     };
 
     img.addEventListener("load", () => {
@@ -661,22 +1042,22 @@ function attachPreview(node) {
             const response = await api.fetchApi("/nl_write/last");
             if (!response.ok) return null;
             const data = await response.json();
-            return data?.payload || null;
+            return data?.payload ? { payload: data.payload, at: data?.at } : null;
         } catch (err) {
             console.warn("[NL Write] Failed to fetch last payload", err);
             return null;
         }
     };
 
-    const applyPayload = (payload) => {
+    const applyPayload = (payload, meta = {}) => {
         if (!payload) return;
         const url = payload.preview_url || payload.url || "";
         const kind = payload.preview_kind || (url.includes("anim=1") ? "video" : "image");
-        const summary = payload.summary || "";
         const savePath = payload.save_path || payload.savePath || "";
         const statsPayload = payload.stats || {};
         const outputs = Array.isArray(statsPayload.outputs) ? statsPayload.outputs : [];
         const logParts = [];
+        const generatedAt = toTimestampMs(meta?.at || payload.at || payload.generated_at || payload.generatedAt);
 
         container.classList.toggle("is-image", kind !== "video");
         container.classList.toggle("is-video", kind === "video");
@@ -691,38 +1072,39 @@ function attachPreview(node) {
         }
 
         if (savePath) {
-            pathEl.textContent = savePath;
             logParts.push(savePath.split(/[\\/]/).pop() || savePath);
-        } else {
-            pathEl.textContent = "No output yet.";
         }
         statsState.mode = statsPayload.mode || "";
         statsState.kind = kind;
+        statsState.hasOutput = Boolean(url || savePath || outputs.length);
+        statsState.generatedAt =
+            generatedAt ??
+            (url || savePath || statsState.mode || statsState.kind ? Date.now() : statsState.generatedAt);
+        statsState.saved = Array.isArray(payload.saved) ? payload.saved : [];
         statsState.frameCount = statsPayload.frame_count ?? null;
         statsState.fps = statsPayload.fps ?? null;
         statsState.extension = statsPayload.extension || "";
-        statsState.outputs = outputs
+        statsState.outputsDetail = outputs
             .map((item) => {
-                const type = item?.type || "";
-                if (type === "png_sequence") return "png seq";
-                if (type === "mp4") return "mp4 proxy";
-                if (type === "mov") return "mov prores";
-                return String(type || "").toLowerCase();
+                if (typeof item === "string") {
+                    return { type: item, path: "" };
+                }
+                return { type: item?.type || "", path: item?.path || "" };
             })
-            .filter(Boolean);
+            .filter((item) => item.type || item.path);
+        if (!statsState.outputsDetail.length && savePath) {
+            statsState.outputsDetail.push({ type: statsPayload.extension || kind || "output", path: savePath });
+        }
+        statsState.outputs = statsState.outputsDetail.map((item) => formatOutputLabel(item.type)).filter(Boolean);
         if (statsState.mode || kind) {
             logParts.unshift(statsState.mode || kind);
         }
         if (statsState.outputs.length) {
             logParts.push(statsState.outputs.join(", "));
         }
-        if (summary) {
-            logParts.push(summary);
-        }
         if (logParts.length) {
             console.debug(`[NL Write] ${logParts.join(" | ")}`);
         }
-        statsState.path = savePath;
         if (!url) {
             statsState.width = null;
             statsState.height = null;
@@ -735,6 +1117,8 @@ function attachPreview(node) {
         computePanelHeight: requestLayout,
         estimateControlsHeight,
         panelState,
+        previewHeightObserver,
+        metaHeightObserver,
     };
     NL_WRITE_NODES.add(node);
 
@@ -747,8 +1131,8 @@ function attachPreview(node) {
             return;
         }
         void fetchLastPayload().then((fallback) => {
-            if (fallback) {
-                applyPayload(fallback);
+            if (fallback?.payload) {
+                applyPayload(fallback.payload, { at: fallback.at });
             }
         });
     };
@@ -756,13 +1140,16 @@ function attachPreview(node) {
     const modeWidget = findWidget(node, "mode");
     const nameWidget = findWidget(node, "name");
     const singleExtensionWidget = findWidget(node, "single_extension");
+    const sequenceEncodingWidgets = [
+        findWidget(node, "sequence_mp4_crf"),
+        findWidget(node, "sequence_mp4_preset"),
+        findWidget(node, "sequence_mov_profile"),
+    ].filter(Boolean);
     const sequenceWidgets = [
         findWidget(node, "sequence_save_png"),
         findWidget(node, "sequence_save_mp4"),
         findWidget(node, "sequence_save_mov"),
-        findWidget(node, "sequence_mp4_crf"),
-        findWidget(node, "sequence_mp4_preset"),
-        findWidget(node, "sequence_mov_profile"),
+        ...sequenceEncodingWidgets,
     ].filter(Boolean);
     let controlsUI = null;
     try {
@@ -790,6 +1177,12 @@ function attachPreview(node) {
                 widget.hidden = !isSequence;
                 widget.disabled = !isSequence;
             });
+            if (isSequence) {
+                sequenceEncodingWidgets.forEach((widget) => {
+                    widget.hidden = true;
+                    widget.disabled = true;
+                });
+            }
         }
         estimateControlsHeight();
         requestLayout();
@@ -851,8 +1244,8 @@ function attachPreview(node) {
             return;
         }
         void fetchLastPayload().then((fallback) => {
-            if (fallback) {
-                applyPayload(fallback);
+            if (fallback?.payload) {
+                applyPayload(fallback.payload, { at: fallback.at });
             }
         });
     };
@@ -862,6 +1255,10 @@ function attachPreview(node) {
         api.removeEventListener("executed", executedHandler);
         NL_WRITE_NODES.delete(node);
         if (node.__nlWriteUI) {
+            node.__nlWriteUI.previewHeightObserver?.disconnect?.();
+            node.__nlWriteUI.heightObserver?.disconnect?.();
+            node.__nlWriteUI.metaHeightObserver?.disconnect?.();
+            node.__nlWriteUI.controlsResizeObserver?.disconnect?.();
             delete node.__nlWriteUI;
         }
         onRemoved?.apply(this, arguments);
@@ -870,17 +1267,32 @@ function attachPreview(node) {
     const originalResize = node.onResize;
     node.onResize = function () {
         originalResize?.apply(this, arguments);
+        node.__nlWriteUI?.enforceNodeSize?.();
         requestLayout();
     };
 
     const originalComputeSize = node.computeSize;
-    node.computeSize = function () {
-        const size = typeof originalComputeSize === "function" ? originalComputeSize.apply(this, arguments) : null;
-        const baseWidth = Array.isArray(size) ? size[0] : this.size?.[0] || 0;
+    const enforceNodeSize = (options = {}) => {
+        const target = node;
+        if (!target) return;
         estimateControlsHeight();
-        const minPreviewHeight = 140;
-        const minHeight = panelState.controlsHeight + getTitleHeight() + minPreviewHeight;
-        return [baseWidth, minHeight];
+        const minHeight = getMinNodeHeight();
+        const minWidth = MIN_NODE_WIDTH;
+        const currentWidth = target.size?.[0] || 0;
+        const currentHeight = target.size?.[1] || 0;
+        const nextWidth = Math.max(currentWidth, minWidth);
+        let nextHeight = Math.max(currentHeight, minHeight);
+        if (options.shrinkHeight && currentHeight > minHeight) {
+            nextHeight = minHeight;
+        }
+        if (target.size && (target.size[0] !== nextWidth || target.size[1] !== nextHeight)) {
+            target.setSize([nextWidth, nextHeight]);
+        }
+    };
+    node.computeSize = function () {
+        estimateControlsHeight();
+        const minHeight = getMinNodeHeight();
+        return [MIN_NODE_WIDTH, minHeight];
     };
 
     if (!GLOBAL_LISTENER_ATTACHED) {
@@ -894,17 +1306,18 @@ function attachPreview(node) {
                 const response = await api.fetchApi("/nl_write/last");
                 if (response.ok) {
                     const data = await response.json();
-                    payload = data?.payload || null;
+                    payload = data?.payload ? { payload: data.payload, at: data?.at } : null;
                 }
             } catch (err) {
                 console.warn("[NL Write] Global fetch failed", err);
             }
-            if (!payload) return;
-            const signature = `${payload.save_path || ""}|${payload.preview_url || ""}|${payload.summary || ""}`;
+            if (!payload?.payload) return;
+            const payloadData = payload.payload;
+            const signature = `${payloadData.save_path || ""}|${payloadData.preview_url || ""}|${payloadData.summary || ""}`;
             if (signature && signature === LAST_PAYLOAD_SIGNATURE) return;
             LAST_PAYLOAD_SIGNATURE = signature;
             NL_WRITE_NODES.forEach((nodeRef) => {
-                nodeRef?.__nlWriteUI?.applyPayload?.(payload);
+                nodeRef?.__nlWriteUI?.applyPayload?.(payloadData, { at: payload.at });
             });
         });
     }
@@ -912,6 +1325,7 @@ function attachPreview(node) {
     node.__nlWriteUI = {
         ...node.__nlWriteUI,
         restoreState: () => restoreWidgetState(node),
+        enforceNodeSize,
         saveState,
     };
 }
@@ -926,12 +1340,12 @@ app.registerExtension({
         nodeType.prototype.onNodeCreated = function () {
             const result = onNodeCreated?.apply(this, arguments);
             attachPreview(this);
-            const minWidth = 440;
-            const minHeight = 520;
-            const nextWidth = Math.max(this.size?.[0] || 0, minWidth);
-            const nextHeight = Math.max(this.size?.[1] || 0, minHeight);
-            if (this.size && (this.size[0] !== nextWidth || this.size[1] !== nextHeight)) {
-                this.setSize([nextWidth, nextHeight]);
+            if (!this.properties) this.properties = {};
+            if (!this.properties[AUTO_SIZE_KEY]) {
+                this.properties[AUTO_SIZE_KEY] = true;
+                this.__nlWriteUI?.enforceNodeSize?.();
+            } else {
+                this.__nlWriteUI?.enforceNodeSize?.();
             }
             this.__nlWriteUI?.estimateControlsHeight?.();
             this.__nlWriteUI?.computePanelHeight?.();
@@ -940,6 +1354,13 @@ app.registerExtension({
         nodeType.prototype.onConfigure = function () {
             const result = onConfigure?.apply(this, arguments);
             this.__nlWriteUI?.restoreState?.();
+            if (!this.properties) this.properties = {};
+            if (!this.properties[AUTO_SIZE_KEY]) {
+                this.properties[AUTO_SIZE_KEY] = true;
+                this.__nlWriteUI?.enforceNodeSize?.();
+            } else {
+                this.__nlWriteUI?.enforceNodeSize?.();
+            }
             return result;
         };
     },
